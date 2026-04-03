@@ -478,14 +478,7 @@ def extract_outlet_counts(operation_rows: list[list[str]]) -> tuple[str | None, 
 
 
 def extract_outlet_totals(operation_rows: list[list[str]]) -> tuple[str | None, str | None]:
-    op_map = rows_to_dict(operation_rows)
-    raw = op_map.get("Accumulated Number of outlets", {}).get("2025YTD")
-    if not raw:
-        return None, None
-    match = re.search(r"(\d+)\s*\+\s*(\d+)\s*\(JV\)", raw)
-    if not match:
-        return None, None
-    return match.group(1), match.group(2)
+    return extract_outlet_counts(operation_rows)
 
 
 def normalize_finance_source(rows: list[list[str]]) -> dict[str, Any]:
@@ -506,17 +499,13 @@ def calc_percent(current: Decimal | None, previous: Decimal | None) -> Decimal |
     return ((current - previous) / denominator) * Decimal("100")
 
 
-def build_business_update_bullets(paragraphs: list[str]) -> list[str]:
-    return []
-
-
 def rewrite_third_person(text: str, company_name: str) -> str:
     text = norm_space(text)
     text = re.sub(r"\bwe\b", company_name, text, flags=re.I)
     text = re.sub(r"\bour\b", f"{company_name}'s", text, flags=re.I)
     text = re.sub(r"\bus\b", company_name, text, flags=re.I)
-    text = text.replace("Q2.", "Q2 2026.")
-    text = text.replace("Q1.", "Q1 2026.")
+    current_year = datetime.now().year
+    text = re.sub(r"\bQ([1-4])\.", lambda m: f"Q{m.group(1)} {current_year}.", text)
     text = re.sub(r"\bthe company\b", company_name, text, flags=re.I)
     return norm_space(text)
 
@@ -1190,8 +1179,6 @@ def build_financial_update(
 
         if source_info and source_info["type"] == "finance_row" and source_row:
             row_current_dec = parse_decimal(values[target_quarter.display()] or "")
-            if row_current_dec is not None and label in {"Revenue", "Gross profit", "EBITDA"}:
-                row_current_dec = Decimal(values[target_quarter.display()])  # same unit in output
 
             previous_q_dec = parse_decimal(values[rolling_headers[1]] or "")
             yoy_dec = parse_decimal(values[rolling_headers[4]] or "")
@@ -1224,7 +1211,7 @@ def build_financial_update(
                 values[estimate_header] = None
                 row_flags.append(f"{estimate_header} is missing in the current data request.")
 
-        else:
+        elif source_info and source_info["type"] == "derived":
             row_current_dec = parse_decimal(values[target_quarter.display()] or "")
             previous_q_dec = parse_decimal(values[rolling_headers[1]] or "")
             yoy_dec = parse_decimal(values[rolling_headers[4]] or "")
@@ -1249,6 +1236,11 @@ def build_financial_update(
                     row_flags.append(f"{final_total_header} is missing for JV outlets.")
             values[estimate_header] = None
             row_flags.append(f"{estimate_header} is missing in the current data request.")
+
+        else:
+            row_flags.append(f"No source data could be mapped for metric '{label}'.")
+            values[final_total_header] = None
+            values[estimate_header] = None
 
         values["QoQ"] = qoq_value
         values["YoY"] = yoy_value
