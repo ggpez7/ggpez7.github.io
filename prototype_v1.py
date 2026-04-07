@@ -1472,7 +1472,24 @@ def get_body_paragraphs_for_occurrence(doc: Document, occurrences: list[DocSecti
     return doc.paragraphs[start:end]
 
 
-def set_paragraph_text_preserve(paragraph, text: str) -> None:
+def set_cell_text_preserve(cell, text: str) -> None:
+    """Set cell text while preserving paragraph and run formatting.
+    Unlike cell.text = value, this doesn't destroy the cell's formatting."""
+    # Keep only the first paragraph, remove extras
+    while len(cell.paragraphs) > 1:
+        last_p = cell.paragraphs[-1]
+        last_p._element.getparent().remove(last_p._element)
+    # Set text on the first paragraph, preserving its formatting
+    p = cell.paragraphs[0]
+    if p.runs:
+        p.runs[0].text = text
+        for run in p.runs[1:]:
+            run.text = ""
+    else:
+        p.text = text
+
+
+
     if paragraph.runs:
         paragraph.runs[0].text = text
         for run in paragraph.runs[1:]:
@@ -1889,28 +1906,24 @@ def write_docx(
             unit_run_format = capture_run_format(outside_unit_paragraph)
             set_paragraph_text_preserve(outside_unit_paragraph, unit_label)
             apply_paragraph_run_format(outside_unit_paragraph, *unit_run_format)
-            table.cell(0, 0).text = ""
+            set_cell_text_preserve(table.cell(0, 0), "")
         elif inside_unit:
-            table.cell(0, 0).text = unit_label
+            set_cell_text_preserve(table.cell(0, 0), unit_label)
 
         for idx, header in enumerate(financial_update["columns"], start=1):
             if idx < len(table.rows[0].cells):
-                table.cell(0, idx).text = header
+                set_cell_text_preserve(table.cell(0, idx), header)
         for row_idx, row_data in enumerate(financial_update["rows"], start=1):
             if row_idx >= len(table.rows):
                 break
-            table.cell(row_idx, 0).text = row_data["label"]
+            set_cell_text_preserve(table.cell(row_idx, 0), row_data["label"])
             for col_idx, header in enumerate(financial_update["columns"], start=1):
                 if col_idx >= len(table.rows[row_idx].cells):
                     break
-                table.cell(row_idx, col_idx).text = row_data["values"].get(header) or ""
+                set_cell_text_preserve(table.cell(row_idx, col_idx), row_data["values"].get(header) or "")
 
         for r_idx, row in enumerate(table.rows):
             for c_idx, cell in enumerate(row.cells):
-                # Remove extra blank paragraphs inside cells (keeps only the first)
-                while len(cell.paragraphs) > 1:
-                    last = cell.paragraphs[-1]
-                    last._element.getparent().remove(last._element)
                 font_name, size_pt, bold = formatting.get((r_idx, c_idx), (None, None, None))
                 for paragraph in cell.paragraphs:
                     for run in paragraph.runs:
