@@ -96,6 +96,10 @@ def is_question_or_prompt(text: str) -> bool:
         r"^elaborate\b",
         r"^provide\b",
         r"^project\b.*\bbalance\b",
+        r"^if there is a (?:significant|major)\b.*\bplease\b",
+        r"\bplease provide\b.*\bexplanation\b",
+        r"^see notes to\b",
+        r">\s*see notes to\b",
         r"^请",
         r"^【重要】请",
         r"如有较大的.*请解释",
@@ -1784,13 +1788,9 @@ def write_docx(
             body = get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx)
             fill_section_paragraphs(doc, body, texts, force_bullets=True)
 
-    for language, occ_indices in risk_occurrences_by_language.items():
-        if not occ_indices:
-            continue
-        chunks = split_evenly(risk_exit_map.get(language, []), len(occ_indices))
-        for occ_idx, texts in zip(occ_indices, chunks):
-            body = get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx)
-            fill_section_paragraphs(doc, body, texts, force_bullets=True)
+    # Risk & Exit: DO NOT rewrite. The template (previous quarter) already has
+    # the correct content. Rewriting via XML extraction and fill_section_paragraphs
+    # is lossy (merges paragraphs, creates duplicates, loses formatting).
 
     financial_occurrences = [occ for occ in occurrences if occ.canonical == "Financial Update"]
     for table_idx, table in enumerate(doc.tables):
