@@ -1856,22 +1856,25 @@ def write_docx(
                     for run in paragraph.runs:
                         apply_table_run_format(run, font_name, size_pt, bold)
 
-    # Clean up blank paragraphs before and after logo/page break insertion
-    occurrences = resolve_section_plan_to_doc(doc, section_plan)
+    # Use detect_doc_section_occurrences for post-edit passes (safer than resolve
+    # which depends on exact text matching against a potentially stale section_plan)
+    def safe_occurrences() -> list[DocSectionOccurrence]:
+        return [occ for occ in detect_doc_section_occurrences(doc)
+                if occ.heading_index < len(doc.paragraphs)]
+
+    occurrences = safe_occurrences()
     remove_blank_paragraphs_inside_sections(doc, occurrences)
     insert_page_break_and_repeated_logo(doc, template_path, occurrences)
-    occurrences = resolve_section_plan_to_doc(doc, section_plan)
+    occurrences = safe_occurrences()
     remove_blank_paragraphs_inside_sections(doc, occurrences)
     normalize_bullet_sections(doc, occurrences)
     normalize_exact_single_blank_between_sections(doc, occurrences)
 
     # Ensure all section headings are bold (after all paragraph shifts are done)
-    occurrences = resolve_section_plan_to_doc(doc, section_plan)
-    for occ in occurrences:
-        if occ.heading_index < len(doc.paragraphs):
-            heading_paragraph = doc.paragraphs[occ.heading_index]
-            for run in heading_paragraph.runs:
-                run.font.bold = True
+    for occ in safe_occurrences():
+        heading_paragraph = doc.paragraphs[occ.heading_index]
+        for run in heading_paragraph.runs:
+            run.font.bold = True
 
     doc.save(str(output_path))
 
