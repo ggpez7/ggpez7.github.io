@@ -1983,46 +1983,40 @@ def normalize_bullet_sections(doc: Document, occurrences: list[DocSectionOccurre
 
 
 def normalize_exact_single_blank_between_sections(doc: Document, occurrences: list[DocSectionOccurrence] | None = None) -> None:
+    """Insert exactly one blank paragraph before each section heading (except the very first)."""
     occurrences = occurrences or detect_doc_section_occurrences(doc)
     if not occurrences:
         return
 
-    first_english_heading_index = None
-    if any(occ.language == "english" for occ in occurrences) and any(occ.language == "chinese" for occ in occurrences):
-        for occ in occurrences:
-            if occ.language == "english":
-                first_english_heading_index = occ.heading_index
-                break
+    # Collect heading paragraph elements by matching text (indices may be stale)
+    heading_texts = set()
+    for occ in occurrences:
+        if occ.heading_index < len(doc.paragraphs):
+            heading_texts.add(norm_space(doc.paragraphs[occ.heading_index].text))
 
-    def remove_paragraph(paragraph) -> None:
-        element = paragraph._element
-        parent = element.getparent()
-        if parent is not None:
-            parent.remove(element)
+    heading_paragraphs = []
+    for p in doc.paragraphs:
+        if norm_space(p.text) in heading_texts:
+            heading_paragraphs.append(p)
 
-    for idx, occurrence in enumerate(occurrences):
-        paragraph = doc.paragraphs[occurrence.heading_index]
-        previous = paragraph._element.getprevious()
-        while previous is not None:
-            prev_paragraph = next((p for p in doc.paragraphs if p._element is previous), None)
-            if prev_paragraph is None or not is_plain_blank_paragraph(prev_paragraph):
-                break
-            remove_paragraph(prev_paragraph)
-            previous = paragraph._element.getprevious()
-
+    for idx, paragraph in enumerate(heading_paragraphs):
+        # Skip the very first heading in the document (no blank needed above it)
         if idx == 0:
             continue
-        if first_english_heading_index is not None and occurrence.heading_index == first_english_heading_index:
-            continue
 
+        # Check if there's already a blank paragraph immediately before this heading
         previous = paragraph._element.getprevious()
-        prev_paragraph = next((p for p in doc.paragraphs if p._element is previous), None) if previous is not None else None
-        if prev_paragraph is None or not is_plain_blank_paragraph(prev_paragraph):
-            blank = paragraph.insert_paragraph_before("")
-            try:
-                blank.style = doc.styles["Normal"]
-            except Exception:
-                pass
+        if previous is not None:
+            prev_p = next((p for p in doc.paragraphs if p._element is previous), None)
+            if prev_p is not None and is_plain_blank_paragraph(prev_p):
+                continue  # already has a blank
+
+        # Insert a blank paragraph before this heading
+        blank = paragraph.insert_paragraph_before("")
+        try:
+            blank.style = doc.styles["Normal"]
+        except Exception:
+            pass
 
 
 def center_table(table) -> None:
