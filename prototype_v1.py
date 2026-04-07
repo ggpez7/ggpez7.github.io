@@ -2178,7 +2178,6 @@ def write_docx(
     occurrences = safe_occurrences()
     remove_blank_paragraphs_inside_sections(doc, occurrences)
     normalize_bullet_sections(doc, occurrences)
-    normalize_exact_single_blank_between_sections(doc, occurrences)
 
     # Ensure all section headings are bold (after all paragraph shifts are done)
     for occ in safe_occurrences():
@@ -2186,22 +2185,19 @@ def write_docx(
         for run in heading_paragraph.runs:
             run.font.bold = True
 
-    # Final pass: remove ALL remaining blank paragraphs in the document
-    # (except those before section headings, which serve as visual separators)
-    heading_indices = {occ.heading_index for occ in safe_occurrences()}
+    # Remove ALL blank paragraphs first, then re-insert exactly one before each heading
     to_remove = []
     for idx, paragraph in enumerate(doc.paragraphs):
-        if not is_plain_blank_paragraph(paragraph):
-            continue
-        # Keep blank before a section heading (visual separator)
-        if idx + 1 < len(doc.paragraphs) and (idx + 1) in heading_indices:
-            continue
-        to_remove.append(paragraph)
+        if is_plain_blank_paragraph(paragraph):
+            to_remove.append(paragraph)
     for paragraph in reversed(to_remove):
         element = paragraph._element
         parent = element.getparent()
         if parent is not None:
             parent.remove(element)
+
+    # Now insert exactly one blank paragraph before each section heading
+    normalize_exact_single_blank_between_sections(doc, safe_occurrences())
 
     doc.save(str(output_path))
 
