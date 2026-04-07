@@ -1140,14 +1140,25 @@ def choose_finance_row_label(
     used_source_labels = used_source_labels or {}
 
     exact_matches = []
+    print(f"    LABEL_MATCH: looking for '{previous_label}' (normalized: '{normalize_metric_label(previous_label)}'), current_total_header={current_total_header!r}")
     for candidate, values in finance_rows.items():
-        if parse_decimal(values.get(current_total_header, "")) is None:
+        val_at_header = values.get(current_total_header, "")
+        parsed_val = parse_decimal(val_at_header)
+        if parsed_val is None:
+            print(f"    LABEL_MATCH: skip '{candidate}' — no parseable value at header (raw={val_at_header!r})")
             continue
         if candidate in used_source_labels and used_source_labels[candidate] != previous_label:
+            print(f"    LABEL_MATCH: skip '{candidate}' — already used by '{used_source_labels[candidate]}'")
             continue
-        if normalize_metric_label(candidate) == normalize_metric_label(previous_label):
+        norm_cand = normalize_metric_label(candidate)
+        norm_prev = normalize_metric_label(previous_label)
+        if norm_cand == norm_prev:
             exact_matches.append(candidate)
+            print(f"    LABEL_MATCH: EXACT match '{candidate}' → value={parsed_val}")
+        else:
+            print(f"    LABEL_MATCH: no exact match '{candidate}' (normalized: '{norm_cand}' vs '{norm_prev}')")
     if len(exact_matches) == 1:
+        print(f"    LABEL_MATCH: RESULT → exact match: '{exact_matches[0]}'")
         return exact_matches[0]
     if len(exact_matches) > 1:
         flags.append(
@@ -1165,6 +1176,7 @@ def choose_finance_row_label(
     best_score: tuple[Decimal, int] | None = None
     ambiguous = False
 
+    print(f"    LABEL_MATCH: no exact match found, trying fuzzy. prev_tokens={prev_tokens}")
     for candidate, values in finance_rows.items():
         if candidate in used_source_labels and used_source_labels[candidate] != previous_label:
             continue
@@ -1185,6 +1197,7 @@ def choose_finance_row_label(
             continuity_penalty = abs(candidate_converted - previous_value)
 
         score = (-continuity_penalty, token_score)
+        print(f"    LABEL_MATCH_FUZZY: '{candidate}' tokens={cand_tokens} overlap={token_score} penalty={continuity_penalty} score={score}")
         if best_score is None or score > best_score:
             best_label = candidate
             best_score = score
@@ -1192,6 +1205,7 @@ def choose_finance_row_label(
         elif score == best_score:
             ambiguous = True
 
+    print(f"    LABEL_MATCH: fuzzy result → best_label={best_label!r}, best_score={best_score}, ambiguous={ambiguous}")
     if best_label is None or best_score is None:
         if any(
             normalize_metric_label(candidate) == normalize_metric_label(previous_label)
@@ -1260,6 +1274,9 @@ def build_financial_update(
     current_total_header = find_current_quarter_total_header(current_finance, target_quarter)
     current_month_headers = find_month_headers_for_quarter(current_finance, target_quarter)
     fy_or_ytd_header = find_fy_or_ytd_header(current_finance, target_quarter)
+    print(f"  DEBUG_BUILD_FIN: target_quarter={target_quarter.display()}, current_total_header={current_total_header!r}, month_headers={current_month_headers}")
+    print(f"  DEBUG_BUILD_FIN: source_unit={source_unit_spec}, output_unit={output_unit_spec}")
+    print(f"  DEBUG_BUILD_FIN: all finance_rows keys: {list(finance_rows.keys())}")
     if current_total_header is None:
         current_total_header = ""
     operation_rows = current_operation_rows or [["", ""]]
@@ -1304,13 +1321,19 @@ def build_financial_update(
         current_quarter_value: str | None = None
         if source_info:
             if source_info["type"] == "finance_row" and source_row:
+                print(f"  VALUE_EXTRACT: label={label!r}, mapped={source_info['label']!r}")
+                print(f"  VALUE_EXTRACT: source_row keys={list(source_row.keys())[:8]}")
+                print(f"  VALUE_EXTRACT: month_headers={current_month_headers}, total_header={current_total_header!r}")
                 decimal_value = sum_month_values(source_row, current_month_headers)
+                print(f"  VALUE_EXTRACT: sum_month_values={decimal_value}")
                 if decimal_value is None and current_total_header:
                     raw_current = source_row.get(current_total_header)
                     decimal_value = parse_decimal(raw_current)
+                    print(f"  VALUE_EXTRACT: total_header lookup → raw={raw_current!r}, parsed={decimal_value}")
                 if decimal_value is not None:
                     converted_value = convert_value_between_units(decimal_value, source_unit_spec, output_unit_spec)
                     current_quarter_value = format_decimal(converted_value)
+                    print(f"  VALUE_EXTRACT: raw={decimal_value} → converted={converted_value} → formatted={current_quarter_value}")
                     source_trace[target_quarter.display()] = "current_data_request"
                 else:
                     row_flags.append("Missing current-quarter value in the company data request.")
@@ -1582,38 +1605,33 @@ def set_paragraph_text_preserve(paragraph, text: str) -> None:
 def set_cell_text_preserve(cell, text: str) -> None:
     """Set cell text while preserving paragraph and run formatting.
     Unlike cell.text = value, this doesn't destroy the cell's formatting."""
-    # Keep only the first paragraph, remove extras
+    # Remove ALL paragraphs except the first
     while len(cell.paragraphs) > 1:
         last_p = cell.paragraphs[-1]
         last_p._element.getparent().remove(last_p._element)
     p = cell.paragraphs[0]
-    # Remove any line break elements (<w:br/>) inside the paragraph
-    for br in p._element.findall(".//" + qn("w:br")):
-        br.getparent().remove(br)
-    # Remove extra runs beyond the first (can cause multi-line display)
-    if p.runs:
-        p.runs[0].text = text
-        for run in p.runs[1:]:
-            run._element.getparent().remove(run._element)
-    else:
-        p.add_run(text)
-    # Reset paragraph spacing to match compact table cells
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.space_after = Pt(0)
-    p.paragraph_format.line_spacing = None
-    p.paragraph_format.line_spacing_rule = None
-    # Remove any extra spacing from paragraph style overrides
-    pPr = p._element.find(qn("w:pPr"))
-    if pPr is not None:
-        spacing = pPr.find(qn("w:spacing"))
-        if spacing is not None:
-            # Clear before/after/line attributes to prevent extra whitespace
-            for attr in ["w:before", "w:after", "w:line", "w:lineRule",
-                         "w:beforeAutospacing", "w:afterAutospacing"]:
-                if spacing.get(qn(attr)) is not None:
-                    del spacing.attrib[qn(attr)]
-            spacing.set(qn("w:before"), "0")
-            spacing.set(qn("w:after"), "0")
+    # Remove ALL child elements except pPr (paragraph properties)
+    for child in list(p._element):
+        if child.tag != qn("w:pPr"):
+            p._element.remove(child)
+    # Add a single clean run with the text
+    run_elem = OxmlElement("w:r")
+    t_elem = OxmlElement("w:t")
+    t_elem.text = text
+    t_elem.set(qn("xml:space"), "preserve")
+    run_elem.append(t_elem)
+    p._element.append(run_elem)
+    # Force compact spacing by creating/replacing <w:spacing> in <w:pPr>
+    pPr = p._element.get_or_add_pPr()
+    old_spacing = pPr.find(qn("w:spacing"))
+    if old_spacing is not None:
+        pPr.remove(old_spacing)
+    spacing = OxmlElement("w:spacing")
+    spacing.set(qn("w:before"), "0")
+    spacing.set(qn("w:after"), "0")
+    spacing.set(qn("w:line"), "240")
+    spacing.set(qn("w:lineRule"), "auto")
+    pPr.append(spacing)
 
 
 def capture_run_format(paragraph) -> tuple[str | None, str | None, float | None, bool | None]:
