@@ -13,8 +13,11 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-sys.path.insert(0, "/tmp/codex_pydeps")
-from docx import Document
+try:
+    from docx import Document
+except ImportError:
+    print("ERROR: python-docx is required. Install it with: pip install python-docx")
+    sys.exit(1)
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_BREAK
 from docx.oxml import OxmlElement
@@ -27,8 +30,8 @@ ROOT = Path(__file__).resolve().parent
 
 
 UNIVERSAL_SPEC = ROOT / "Universal Spec .docx"
-CURRENT_DATA_REQUEST = ROOT / "DataRequest Samples" / "PopMeals 2025Q4_DataRequest.docx"
-PREVIOUS_REVIEW = ROOT / "Previous Quarter Template" / "05 Pop Meals 2025Q3.docx"
+DATA_REQUEST_DIR = ROOT / "DataRequest Samples"
+PREVIOUS_REVIEW_DIR = ROOT / "Previous Quarter Template"
 OUTPUT_DIR = ROOT / "prototype_output"
 DEBUG_OUTPUT_DIR = OUTPUT_DIR / "_debug"
 
@@ -73,24 +76,50 @@ SECTION_ALIASES = {
 }
 
 
-QUESTION_PREFIXES_TO_IGNORE = [
-    "Please brief intro of the business updates",
-    "Please elaborate on the updated plan for further outlet expansion",
-    "Please provide an updated plan for further revenue growth",
-    "Please project the cash balance",
-    "Please describe the team development",
-    "What is the strategic plan for 2026?",
-    "What is the company’s plan for the next round of financing",
-    "What is the company's plan for the next round of financing",
-]
+def is_question_or_prompt(text: str) -> bool:
+    """Detect question/prompt paragraphs generically instead of hardcoding."""
+    stripped = norm_space(text)
+    if not stripped:
+        return False
+    if re.search(r"[?？]$", stripped):
+        return True
+    prompt_patterns = [
+        r"^please\b",
+        r"^what is\b",
+        r"^what are\b",
+        r"^how does\b",
+        r"^how do\b",
+        r"^can you\b",
+        r"^could you\b",
+        r"^describe\b",
+        r"^explain\b",
+        r"^elaborate\b",
+        r"^provide\b",
+        r"^project\b.*\bbalance\b",
+        r"^请",
+        r"^【重要】请",
+        r"如有较大的.*请解释",
+    ]
+    lowered = stripped.lower()
+    return any(re.search(p, lowered) for p in prompt_patterns)
 
-STANDALONE_LABELS_TO_IGNORE = {
-    "Equity Financing",
-    "Financing via Joint venture:",
-    "Loan facility:",
-    "Further growth initiatives in Q1:",
-    "This transformation was fueled by aggressive operational efficiencies, including:",
-}
+
+def is_standalone_label(text: str) -> bool:
+    """Detect short standalone labels/headers that aren’t real content."""
+    stripped = norm_space(text)
+    if not stripped:
+        return False
+    if stripped.endswith((":", "：")) and len(stripped) < 80:
+        return True
+    if re.match(r"^\d+[.)\s]", stripped) and len(stripped) < 60:
+        return True
+    section_label_patterns = [
+        r"^other\s+questions",
+        r"^operational\s+data",
+        r"^业务发展$",
+    ]
+    lowered = stripped.lower()
+    return any(re.search(p, lowered) for p in section_label_patterns)
 
 
 def norm_space(text: str) -> str:
@@ -431,9 +460,9 @@ def parse_current_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                 if item["type"] != "paragraph":
                     continue
                 text = item["text"]
-                if any(text.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
+                if is_question_or_prompt(text):
                     continue
-                if text in STANDALONE_LABELS_TO_IGNORE:
+                if is_standalone_label(text):
                     continue
                 result["business_update_paragraphs"].append(text)
             break
@@ -447,9 +476,9 @@ def parse_current_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             if not seen_table or block["type"] != "paragraph":
                 continue
             text = block["text"]
-            if any(text.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
+            if is_question_or_prompt(text):
                 continue
-            if text in STANDALONE_LABELS_TO_IGNORE:
+            if is_standalone_label(text):
                 continue
             if len(text) < 2:
                 continue
@@ -468,24 +497,29 @@ def rows_to_dict(rows: list[list[str]]) -> dict[str, dict[str, str]]:
 
 def extract_outlet_counts(operation_rows: list[list[str]]) -> tuple[str | None, str | None]:
     op_map = rows_to_dict(operation_rows)
-    raw = op_map.get("Accumulated Number of outlets", {}).get("2025YTD")
-    if not raw:
+    outlet_row = None
+    for label in op_map:
+        if "outlet" in label.lower() and "accumul" in label.lower():
+            outlet_row = op_map[label]
+            break
+    if outlet_row is None:
+        outlet_row = op_map.get("Accumulated Number of outlets", {})
+    ytd_value = None
+    for header, value in outlet_row.items():
+        if "ytd" in header.lower() or "accum" in header.lower() or "total" in header.lower():
+            ytd_value = value
+            break
+    if not ytd_value:
+        values = list(outlet_row.values())
+        ytd_value = values[-1] if values else None
+    if not ytd_value:
         return None, None
-    match = re.search(r"(\d+)\s*\+\s*(\d+)\s*\(JV\)", raw)
+    match = re.search(r"(\d+)\s*\+\s*(\d+)\s*\(JV\)", ytd_value)
     if not match:
-        return None, None
+        plain = re.search(r"(\d+)", ytd_value)
+        return (plain.group(1), None) if plain else (None, None)
     return match.group(1), match.group(2)
 
-
-def extract_outlet_totals(operation_rows: list[list[str]]) -> tuple[str | None, str | None]:
-    op_map = rows_to_dict(operation_rows)
-    raw = op_map.get("Accumulated Number of outlets", {}).get("2025YTD")
-    if not raw:
-        return None, None
-    match = re.search(r"(\d+)\s*\+\s*(\d+)\s*\(JV\)", raw)
-    if not match:
-        return None, None
-    return match.group(1), match.group(2)
 
 
 def normalize_finance_source(rows: list[list[str]]) -> dict[str, Any]:
@@ -506,17 +540,12 @@ def calc_percent(current: Decimal | None, previous: Decimal | None) -> Decimal |
     return ((current - previous) / denominator) * Decimal("100")
 
 
-def build_business_update_bullets(paragraphs: list[str]) -> list[str]:
-    return []
-
-
 def rewrite_third_person(text: str, company_name: str) -> str:
     text = norm_space(text)
     text = re.sub(r"\bwe\b", company_name, text, flags=re.I)
     text = re.sub(r"\bour\b", f"{company_name}'s", text, flags=re.I)
     text = re.sub(r"\bus\b", company_name, text, flags=re.I)
-    text = text.replace("Q2.", "Q2 2026.")
-    text = text.replace("Q1.", "Q1 2026.")
+    text = re.sub(r"\bQ([1-4])\.", r"Q\1", text)
     text = re.sub(r"\bthe company\b", company_name, text, flags=re.I)
     return norm_space(text)
 
@@ -531,57 +560,52 @@ def short_sentence(text: str, company_name: str, limit: int = 140) -> str:
     return clipped + "."
 
 
-def build_business_update_bullets(paragraphs: list[str], company_name: str) -> list[str]:
-    full_text = " ".join(norm_space(p) for p in paragraphs)
-    lower = full_text.lower()
+def score_paragraph_informativeness(text: str) -> float:
+    """Score a paragraph by how much useful business information it contains.
+    Higher score = more informative (numbers, metrics, dollar amounts, percentages, specifics)."""
+    score = 0.0
+    score += len(re.findall(r"\$[\d,.]+[kmb]?", text, re.I)) * 3.0
+    score += len(re.findall(r"\d+(?:\.\d+)?%", text)) * 2.5
+    score += len(re.findall(r"\b\d{1,3}(?:,\d{3})+\b", text)) * 2.0
+    score += len(re.findall(r"\b\d+(?:\.\d+)?\s*(?:x|times|million|billion|k)\b", text, re.I)) * 2.0
+    score += len(re.findall(r"\bQ[1-4]\s*20\d{2}\b", text, re.I)) * 1.5
+    score += len(re.findall(r"\b(?:revenue|profit|ebitda|margin|growth|cost|loss|cash flow|burn rate|funding|financing|expansion|launched|achieved|target|milestone)\b", text, re.I)) * 1.0
+    score += len(re.findall(r"\b(?:YoY|QoQ|year.over.year|quarter.over.quarter|month.over.month)\b", text, re.I)) * 1.5
+    length_bonus = min(len(text) / 200.0, 1.0)
+    score += length_bonus
+    if len(text) < 30:
+        score *= 0.3
+    return score
+
+
+def build_business_update_bullets(paragraphs: list[str], company_name: str, max_bullets: int = 9) -> list[str]:
+    """Extract the most informative paragraphs as bullet points, scored by content richness."""
+    cleaned = clean_update_paragraphs(paragraphs)
+    scored: list[tuple[float, str]] = []
+    for text in cleaned:
+        text = norm_space(text)
+        if len(text) < 20:
+            continue
+        if text.endswith((":", "：")):
+            continue
+        score = score_paragraph_informativeness(text)
+        scored.append((score, text))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
     bullets: list[str] = []
+    seen_keys: set[str] = set()
+    for _score, text in scored:
+        bullet = short_sentence(text, company_name, limit=200)
+        key = re.sub(r"[^a-z0-9]", "", bullet.lower())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        bullets.append(bullet)
+        if len(bullets) >= max_bullets:
+            break
 
-    if "profit-first growth model" in lower or "revenue mix" in lower:
-        bullets.append(f"{company_name} shifted to a profit-first growth model in Q4 2025, prioritized higher-margin sales, and reached a record +5% EBITDA margin in December.")
-    if "ebitda positive" in lower or "positive operating cash flow" in lower or "net burn" in lower:
-        bullets.append(f"{company_name} turned EBITDA positive for Q4 2025, reached positive operating cash flow, and reduced monthly net burn to about $25k.")
-    if "popcorn chicken" in lower or "cost cutting" in lower or "in-house" in lower or "in-housing" in lower:
-        bullets.append(f"Operational efficiency initiatives, including in-house production and cost optimization, supported gross profit growth of over 30% year over year and lower operating costs.")
-    if "$22k per month" in lower or "food cost savings" in lower:
-        bullets.append(f"In-house popcorn chicken production and related manufacturing changes were expected to add about $22k of monthly food-cost savings into Q1 2026.")
-    if "$20k per month" in lower or "maintenance and performance marketing" in lower or "content marketing" in lower:
-        bullets.append(f"In-sourcing maintenance and marketing functions was expected to deliver about $20k of additional monthly savings while improving execution.")
-    if "fixed schedule of 2 outlets per month" in lower or "24 new outlets" in lower or "jv partner committed" in lower:
-        bullets.append(f"The JV rollout moved to a fixed 2-outlet-per-month schedule covering 24 outlets over 12 months, improving visibility on expansion and opening-fee inflows.")
-    if "internal equity round" in lower or "equity raise" in lower:
-        bullets.append(f"{company_name} was in the process of closing an internal equity round to support the path to positive cash flow and improve access to larger financing lines.")
-    if "$2.3m" in lower or "loan facility" in lower or "$175k" in lower or "$250k" in lower or "$2.5m" in lower:
-        bullets.append(f"The financing pipeline included a loan facility of up to $2.3m, a $175k lender top-up, a $250k supplier financing line, and a potential $2.5m hire-purchase facility.")
-    if "$600k in opening fees" in lower or "private investors" in lower or "outlet-partner financings" in lower:
-        bullets.append(f"Expansion funding was also supported by a JV arrangement worth about $600k in opening fees and additional private or investor-backed outlet financing.")
-    if "4 outlets per months" in lower or "4 outlets per month" in lower:
-        bullets.append(f"{company_name} targets at least 4 outlet openings per month from Q2 2026 as additional funding sources are unlocked.")
-    if "halal certification" in lower:
-        bullets.append(f"Halal certification for the central kitchen and outlets was highlighted as a near-term milestone, with comparable brands cited at 10%-20% sales uplift after certification.")
-    if "add-ons" in lower or "mozza sticks" in lower or "onion rings" in lower or "churros" in lower:
-        bullets.append(f"New add-on products such as sides and snacks were introduced as an incremental revenue initiative, with about 6% revenue growth potential.")
-    if "b2b" in lower or "event sales" in lower or "catering" in lower:
-        bullets.append(f"B2B and event catering were being developed as additional sales channels for 2026, with about 2% sales growth potential.")
-    if "positive net cash flow in q2 2026" in lower or "lower-cost financing" in lower:
-        bullets.append(f"{company_name} targets positive net cash flow in Q2 2026, which management expects would unlock lower-cost financing and support faster expansion.")
-
-    if not bullets:
-        for paragraph in paragraphs:
-            text = norm_space(paragraph)
-            if len(text) < 20:
-                continue
-            bullets.append(short_sentence(text, company_name))
-            if len(bullets) >= 6:
-                break
-
-    deduped: list[str] = []
-    seen = set()
-    for bullet in bullets:
-        key = bullet.lower()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(bullet)
-    return deduped[:9]
+    return bullets
 
 
 def clean_update_paragraphs(paragraphs: list[str]) -> list[str]:
@@ -590,22 +614,9 @@ def clean_update_paragraphs(paragraphs: list[str]) -> list[str]:
         text = norm_space(text)
         if not text:
             continue
-        if any(text.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
+        if is_question_or_prompt(text):
             continue
-        if text in STANDALONE_LABELS_TO_IGNORE:
-            continue
-        if text in {
-            "Other Questions:",
-            "业务发展",
-            "3. Other questions:",
-            "2. Operational Data",
-            "【重要】请提供2025Q4的财务报表（资产负债表、现金流量表、利润表）",
-            "如有较大的收入/毛利下滑或上升，请解释背后原因：",
-        }:
-            continue
-        if re.search(r"[?？]$", text):
-            continue
-        if re.match(r"^\d+[.)]", text):
+        if is_standalone_label(text):
             continue
         cleaned.append(text)
     return cleaned
@@ -1112,7 +1123,7 @@ def build_financial_update(
         current_total_header = ""
     operation_rows = current_operation_rows or [["", ""]]
     company_outlets, jv_outlets = extract_outlet_counts(operation_rows)
-    company_outlets_total, jv_outlets_total = extract_outlet_totals(operation_rows)
+    company_outlets_total, jv_outlets_total = extract_outlet_counts(operation_rows)
 
     rows_output: list[dict[str, Any]] = []
     used_source_labels: dict[str, str] = {}
@@ -1859,12 +1870,12 @@ def extract_company_name(title: str, business_activities: str) -> str:
     cleaned = re.sub(r"[_-]+", " ", cleaned)
     cleaned = norm_space(cleaned)
     if cleaned:
-        return cleaned.replace("PopMeals", "Pop Meals")
+        return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", cleaned)
     return "The Company"
 
 
 def normalize_name_tokens(text: str) -> list[str]:
-    text = text.replace("PAISensing", "Paisensing").replace("PopMeals", "Pop Meals")
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)  # split CamelCase generically
     text = re.sub(r"20\d{2}Q[1-4]", " ", text, flags=re.I)
     text = re.sub(r"20\d{2}", " ", text)
     text = re.sub(r"q[1-4]", " ", text, flags=re.I)
@@ -1893,7 +1904,7 @@ def infer_current_company_name(path: Path) -> str:
         cleaned = re.sub(r"业务概览.*", "", cleaned)
         cleaned = norm_space(cleaned)
         if cleaned:
-            return cleaned.replace("PopMeals", "Pop Meals")
+            return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", cleaned)
     return path.stem
 
 
@@ -2001,8 +2012,8 @@ def match_current_to_previous(current_files: list[Path], previous_files: list[Pa
 
 
 def run_matching_report() -> None:
-    current_files = list_real_docx(ROOT / "DataRequest Samples")
-    previous_files = list_real_docx(ROOT / "Previous Quarter Template")
+    current_files = list_real_docx(DATA_REQUEST_DIR)
+    previous_files = list_real_docx(PREVIOUS_REVIEW_DIR)
     reports = match_current_to_previous(current_files, previous_files)
     print("Matching Report")
     print("")
@@ -2248,8 +2259,8 @@ def debug_generation_for_pair(current_path: Path, previous_path: Path) -> None:
 
 
 def run_batch_generation() -> None:
-    current_files = list_real_docx(ROOT / "DataRequest Samples")
-    previous_files = list_real_docx(ROOT / "Previous Quarter Template")
+    current_files = list_real_docx(DATA_REQUEST_DIR)
+    previous_files = list_real_docx(PREVIOUS_REVIEW_DIR)
     reports = match_current_to_previous(current_files, previous_files)
     clean_main_output_folder_for_batch()
 
@@ -2265,7 +2276,24 @@ def run_batch_generation() -> None:
 
 
 def main() -> None:
-    generate_review_for_pair(CURRENT_DATA_REQUEST, PREVIOUS_REVIEW)
+    current_files = list_real_docx(DATA_REQUEST_DIR)
+    previous_files = list_real_docx(PREVIOUS_REVIEW_DIR)
+    if not current_files:
+        print(f"ERROR: No .docx files found in {DATA_REQUEST_DIR}")
+        sys.exit(1)
+    if not previous_files:
+        print(f"ERROR: No .docx files found in {PREVIOUS_REVIEW_DIR}")
+        sys.exit(1)
+    if not UNIVERSAL_SPEC.exists():
+        print(f"WARNING: Universal Spec not found at {UNIVERSAL_SPEC}")
+    reports = match_current_to_previous(current_files, previous_files)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    for item in reports:
+        current_path = ROOT / item["current_file"]
+        previous_path = ROOT / item["matched_previous_file"]
+        print(f"Processing: {current_path.name} <-> {previous_path.name} (confidence: {item['confidence']})")
+        result = generate_review_for_pair(current_path, previous_path)
+        print(f"  -> {result['output_file']}")
 
 
 if __name__ == "__main__":
@@ -2276,7 +2304,7 @@ if __name__ == "__main__":
     elif "--debug-company" in sys.argv:
         idx = sys.argv.index("--debug-company")
         keyword = sys.argv[idx + 1]
-        reports = match_current_to_previous(list_real_docx(ROOT / "DataRequest Samples"), list_real_docx(ROOT / "Previous Quarter Template"))
+        reports = match_current_to_previous(list_real_docx(DATA_REQUEST_DIR), list_real_docx(PREVIOUS_REVIEW_DIR))
         matched = None
         for item in reports:
             if keyword.lower() in item["current_file"].lower() or keyword.lower() in item["matched_previous_file"].lower():
