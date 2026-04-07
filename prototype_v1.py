@@ -90,15 +90,22 @@ def is_question_or_prompt(text: str) -> bool:
         r"^what are\b",
         r"^how does\b",
         r"^how do\b",
+        r"^how much\b",
+        r"^how many\b",
         r"^can you\b",
         r"^could you\b",
+        r"^would you\b",
         r"^describe\b",
         r"^explain\b",
         r"^elaborate\b",
         r"^provide\b",
+        r"^list\b.*\b(?:key|main|major|top)\b",
+        r"^note\b.*\bany\b",
         r"^project\b.*\bbalance\b",
         r"^if there is a (?:significant|major)\b.*\bplease\b",
+        r"^if there (?:is|are)\b.*\bplease\b",
         r"\bplease provide\b.*\bexplanation\b",
+        r"\bplease\b.*\b(?:describe|explain|elaborate|provide|list|detail|share|clarify|specify|confirm)\b",
         r"^see notes to\b",
         r">\s*see notes to\b",
         r"^what'?s the\b",
@@ -109,9 +116,27 @@ def is_question_or_prompt(text: str) -> bool:
         r"^are there\b",
         r"^do you\b",
         r"^have you\b",
+        r"^does the\b",
+        r"^did the\b",
+        r"^will the\b",
+        r"^has the\b",
+        # Chinese question/prompt patterns (without question marks)
         r"^请",
         r"^【重要】请",
         r"如有较大的.*请解释",
+        r"^请问",
+        r"^是否",
+        r"^能否",
+        r"^有没有",
+        r"^有无",
+        r"请说明",
+        r"请提供",
+        r"请描述",
+        r"请列出",
+        r"请解释",
+        r"请详细",
+        r"请补充",
+        r"请确认",
     ]
     # Normalize curly quotes to straight for matching
     lowered = stripped.lower().replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
@@ -1539,18 +1564,39 @@ def set_cell_text_preserve(cell, text: str) -> None:
     # Reset paragraph spacing to match compact table cells
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = None
+    p.paragraph_format.line_spacing_rule = None
+    # Remove any extra spacing from paragraph style overrides
+    pPr = p._element.find(qn("w:pPr"))
+    if pPr is not None:
+        spacing = pPr.find(qn("w:spacing"))
+        if spacing is not None:
+            # Clear before/after/line attributes to prevent extra whitespace
+            for attr in ["w:before", "w:after", "w:line", "w:lineRule",
+                         "w:beforeAutospacing", "w:afterAutospacing"]:
+                if spacing.get(qn(attr)) is not None:
+                    del spacing.attrib[qn(attr)]
+            spacing.set(qn("w:before"), "0")
+            spacing.set(qn("w:after"), "0")
 
 
-def capture_run_format(paragraph) -> tuple[str | None, float | None, bool | None]:
+def capture_run_format(paragraph) -> tuple[str | None, str | None, float | None, bool | None]:
+    """Returns (font_name, east_asia_font, size_pt, bold)."""
     for run in paragraph.runs:
         font_name = run.font.name
+        east_asia_font = None
+        rpr = run._element.find(qn("w:rPr"))
+        if rpr is not None:
+            rfonts = rpr.find(qn("w:rFonts"))
+            if rfonts is not None:
+                east_asia_font = rfonts.get(qn("w:eastAsia"))
         size_pt = float(run.font.size.pt) if run.font.size is not None else None
         bold = run.font.bold
-        return font_name, size_pt, bold
-    return None, None, None
+        return font_name, east_asia_font, size_pt, bold
+    return None, None, None, None
 
 
-def apply_paragraph_run_format(paragraph, font_name: str | None, size_pt: float | None, bold: bool | None) -> None:
+def apply_paragraph_run_format(paragraph, font_name: str | None, east_asia_font: str | None, size_pt: float | None, bold: bool | None) -> None:
     for run in paragraph.runs:
         if font_name:
             run.font.name = font_name
@@ -1559,7 +1605,12 @@ def apply_paragraph_run_format(paragraph, font_name: str | None, size_pt: float 
             rfonts.set(qn("w:ascii"), font_name)
             rfonts.set(qn("w:hAnsi"), font_name)
             rfonts.set(qn("w:cs"), font_name)
-            rfonts.set(qn("w:eastAsia"), font_name)
+            # Use the East Asian font if captured, otherwise fall back to font_name
+            rfonts.set(qn("w:eastAsia"), east_asia_font or font_name)
+        elif east_asia_font:
+            rpr = run._element.get_or_add_rPr()
+            rfonts = rpr.get_or_add_rFonts()
+            rfonts.set(qn("w:eastAsia"), east_asia_font)
         if size_pt is not None:
             run.font.size = Pt(size_pt)
         run.font.bold = bold
@@ -1625,7 +1676,7 @@ def fill_section_paragraphs(doc: Document, paragraphs, texts: list[str], force_b
         pass
 
     template_style = None
-    template_run_format = (None, None, None)
+    template_run_format = (None, None, None, None)
     for paragraph in slots:
         if paragraph.text.strip():
             template_style = paragraph.style
@@ -1794,10 +1845,11 @@ def normalize_bullet_sections(doc: Document, occurrences: list[DocSectionOccurre
         if not content_paragraphs:
             continue
         bullet_reference = next((p for p in content_paragraphs if paragraph_is_list_like(p)), content_paragraphs[0])
-        run_format = capture_run_format(bullet_reference)
+        font_name, east_asia_font, size_pt, _bold = capture_run_format(bullet_reference)
         for paragraph in content_paragraphs:
             copy_paragraph_layout(paragraph, bullet_reference)
-            apply_paragraph_run_format(paragraph, *run_format)
+            # Always set bold=False for content paragraphs; headings get bold separately
+            apply_paragraph_run_format(paragraph, font_name, east_asia_font, size_pt, False)
 
 
 def normalize_exact_single_blank_between_sections(doc: Document, occurrences: list[DocSectionOccurrence] | None = None) -> None:
@@ -1864,7 +1916,7 @@ def write_docx(
 ) -> None:
     doc = Document(str(template_path))
 
-    def apply_table_run_format(run, font_name: str | None, size_pt: float | None, bold: bool | None) -> None:
+    def apply_table_run_format(run, font_name: str | None, east_asia_font: str | None, size_pt: float | None, bold: bool | None) -> None:
         if font_name:
             run.font.name = font_name
             rpr = run._element.get_or_add_rPr()
@@ -1872,7 +1924,11 @@ def write_docx(
             rfonts.set(qn("w:ascii"), font_name)
             rfonts.set(qn("w:hAnsi"), font_name)
             rfonts.set(qn("w:cs"), font_name)
-            rfonts.set(qn("w:eastAsia"), font_name)
+            rfonts.set(qn("w:eastAsia"), east_asia_font or font_name)
+        elif east_asia_font:
+            rpr = run._element.get_or_add_rPr()
+            rfonts = rpr.get_or_add_rFonts()
+            rfonts.set(qn("w:eastAsia"), east_asia_font)
         if size_pt is not None:
             run.font.size = Pt(size_pt)
         run.font.bold = bold
@@ -1914,15 +1970,21 @@ def write_docx(
             break
         center_table(table)
         financial_update = financial_updates[table_idx]
-        formatting: dict[tuple[int, int], tuple[str | None, float | None, bool | None]] = {}
+        formatting: dict[tuple[int, int], tuple[str | None, str | None, float | None, bool | None]] = {}
         for r_idx, row in enumerate(table.rows):
             for c_idx, cell in enumerate(row.cells):
                 font_name = None
+                east_asia_font = None
                 size_pt = None
                 bold = None
                 for paragraph in cell.paragraphs:
                     for run in paragraph.runs:
                         font_name = run.font.name or font_name
+                        rpr = run._element.find(qn("w:rPr"))
+                        if rpr is not None:
+                            rfonts = rpr.find(qn("w:rFonts"))
+                            if rfonts is not None:
+                                east_asia_font = rfonts.get(qn("w:eastAsia")) or east_asia_font
                         if run.font.size is not None:
                             size_pt = float(run.font.size.pt)
                         if run.font.bold is not None:
@@ -1930,7 +1992,7 @@ def write_docx(
                         break
                     if font_name or size_pt is not None or bold is not None:
                         break
-                formatting[(r_idx, c_idx)] = (font_name, size_pt, bold)
+                formatting[(r_idx, c_idx)] = (font_name, east_asia_font, size_pt, bold)
 
         unit_label = financial_update["unit"]
         top_left_original = norm_space(table.cell(0, 0).text)
@@ -1967,10 +2029,10 @@ def write_docx(
 
         for r_idx, row in enumerate(table.rows):
             for c_idx, cell in enumerate(row.cells):
-                font_name, size_pt, bold = formatting.get((r_idx, c_idx), (None, None, None))
+                font_name, east_asia_font, size_pt, bold = formatting.get((r_idx, c_idx), (None, None, None, None))
                 for paragraph in cell.paragraphs:
                     for run in paragraph.runs:
-                        apply_table_run_format(run, font_name, size_pt, bold)
+                        apply_table_run_format(run, font_name, east_asia_font, size_pt, bold)
 
     # Use detect_doc_section_occurrences for post-edit passes (safer than resolve
     # which depends on exact text matching against a potentially stale section_plan)
