@@ -405,11 +405,22 @@ def parse_decimal(text: str) -> Decimal | None:
     negative = cleaned.startswith("(") and cleaned.endswith(")")
     cleaned = cleaned.strip("()")
     cleaned = cleaned.replace("Positive cf", "").replace("Better", "").strip()
+    # Detect K/M/B suffix multiplier before stripping letters
+    suffix_multiplier = Decimal("1")
+    suffix_match = re.search(r"(\d)\s*([KkMmBb])\s*$", cleaned)
+    if suffix_match:
+        suffix_char = suffix_match.group(2).upper()
+        if suffix_char == "K":
+            suffix_multiplier = Decimal("1000")
+        elif suffix_char == "M":
+            suffix_multiplier = Decimal("1000000")
+        elif suffix_char == "B":
+            suffix_multiplier = Decimal("1000000000")
     cleaned = re.sub(r"[^0-9.+-]", "", cleaned)
     if not cleaned:
         return None
     try:
-        value = Decimal(cleaned)
+        value = Decimal(cleaned) * suffix_multiplier
     except Exception:
         return None
     return -value if negative else value
@@ -1488,8 +1499,20 @@ def set_cell_text_preserve(cell, text: str) -> None:
     while len(cell.paragraphs) > 1:
         last_p = cell.paragraphs[-1]
         last_p._element.getparent().remove(last_p._element)
-    # Set text on the first paragraph, preserving its formatting
-    set_paragraph_text_preserve(cell.paragraphs[0], text)
+    p = cell.paragraphs[0]
+    # Remove any line break elements (<w:br/>) inside the paragraph
+    for br in p._element.findall(".//" + qn("w:br")):
+        br.getparent().remove(br)
+    # Remove extra runs beyond the first (can cause multi-line display)
+    if p.runs:
+        p.runs[0].text = text
+        for run in p.runs[1:]:
+            run._element.getparent().remove(run._element)
+    else:
+        p.add_run(text)
+    # Reset paragraph spacing to match compact table cells
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
 
 
 def capture_run_format(paragraph) -> tuple[str | None, float | None, bool | None]:
