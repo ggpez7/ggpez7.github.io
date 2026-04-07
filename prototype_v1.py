@@ -1472,6 +1472,15 @@ def get_body_paragraphs_for_occurrence(doc: Document, occurrences: list[DocSecti
     return doc.paragraphs[start:end]
 
 
+def set_paragraph_text_preserve(paragraph, text: str) -> None:
+    if paragraph.runs:
+        paragraph.runs[0].text = text
+        for run in paragraph.runs[1:]:
+            run.text = ""
+    else:
+        paragraph.add_run(text)
+
+
 def set_cell_text_preserve(cell, text: str) -> None:
     """Set cell text while preserving paragraph and run formatting.
     Unlike cell.text = value, this doesn't destroy the cell's formatting."""
@@ -1480,13 +1489,7 @@ def set_cell_text_preserve(cell, text: str) -> None:
         last_p = cell.paragraphs[-1]
         last_p._element.getparent().remove(last_p._element)
     # Set text on the first paragraph, preserving its formatting
-    p = cell.paragraphs[0]
-    if p.runs:
-        p.runs[0].text = text
-        for run in p.runs[1:]:
-            run.text = ""
-    else:
-        p.text = text
+    set_paragraph_text_preserve(cell.paragraphs[0], text)
 
 
 
