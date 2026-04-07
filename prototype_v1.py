@@ -1627,9 +1627,9 @@ def insert_page_break_and_repeated_logo(doc: Document, template_path: Path, occu
     english_start = doc.paragraphs[english_occurrences[0].heading_index]
     logo_path, alignment, style, size = find_logo_info(doc, template_path)
 
-    break_paragraph = english_start.insert_paragraph_before("")
-    break_paragraph.add_run().add_break(WD_BREAK.PAGE)
-
+    # Insert logo first, then page break before it, so final order is:
+    # [page break] [logo] [english heading]
+    logo_ref = english_start  # reference for page break insertion
     if logo_path is not None:
         logo_paragraph = english_start.insert_paragraph_before("")
         if style is not None:
@@ -1644,10 +1644,14 @@ def insert_page_break_and_repeated_logo(doc: Document, template_path: Path, occu
             run.add_picture(str(logo_path), width=width, height=height)
         else:
             run.add_picture(str(logo_path))
+        logo_ref = logo_paragraph  # insert page break before the logo
         try:
             logo_path.unlink()
         except Exception:
             pass
+
+    break_paragraph = logo_ref.insert_paragraph_before("")
+    break_paragraph.add_run().add_break(WD_BREAK.PAGE)
 
 
 def remove_blank_paragraphs_inside_sections(doc: Document, occurrences: list[DocSectionOccurrence] | None = None) -> None:
@@ -1852,6 +1856,18 @@ def write_docx(
                     for run in paragraph.runs:
                         apply_table_run_format(run, font_name, size_pt, bold)
 
+    # Ensure all section headings are bold
+    for occ in occurrences:
+        heading_paragraph = doc.paragraphs[occ.heading_index]
+        for run in heading_paragraph.runs:
+            run.font.bold = True
+        if not heading_paragraph.runs and heading_paragraph.text.strip():
+            heading_paragraph.runs  # force creation
+            for run in heading_paragraph.runs:
+                run.font.bold = True
+
+    # Clean up blank paragraphs before and after logo/page break insertion
+    remove_blank_paragraphs_inside_sections(doc, occurrences)
     insert_page_break_and_repeated_logo(doc, template_path, occurrences)
     occurrences = resolve_section_plan_to_doc(doc, section_plan)
     remove_blank_paragraphs_inside_sections(doc, occurrences)
@@ -2075,7 +2091,15 @@ def generate_review_for_pair(current_path: Path, previous_path: Path) -> dict[st
         if occurrence.canonical == "Business Activities" and occurrence.paragraphs:
             business_activity_map.setdefault(occurrence.language, " ".join(occurrence.paragraphs).strip())
         elif occurrence.canonical == "Risk & Exit" and occurrence.paragraphs:
-            risk_exit_map.setdefault(occurrence.language, occurrence.paragraphs)
+            if occurrence.language not in risk_exit_map:
+                seen = set()
+                deduped = []
+                for p in occurrence.paragraphs:
+                    key = norm_space(p).lower()
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(p)
+                risk_exit_map[occurrence.language] = deduped
         elif occurrence.canonical == "Business Update" and occurrence.paragraphs:
             previous_business_update_map.setdefault(occurrence.language, [])
             previous_business_update_map[occurrence.language].extend(occurrence.paragraphs)
