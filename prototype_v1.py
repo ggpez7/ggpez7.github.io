@@ -113,7 +113,8 @@ def is_question_or_prompt(text: str) -> bool:
         r"^【重要】请",
         r"如有较大的.*请解释",
     ]
-    lowered = stripped.lower()
+    # Normalize curly quotes to straight for matching
+    lowered = stripped.lower().replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
     return any(re.search(p, lowered) for p in prompt_patterns)
 
 
@@ -618,9 +619,32 @@ def split_into_sentences(text: str) -> list[str]:
     return result if result else [text]
 
 
+CONTINUATION_PATTERNS = re.compile(
+    r"^(?:among them|in addition|additionally|furthermore|moreover|also|"
+    r"in particular|specifically|for (?:example|instance)|this (?:includes?|means?)|"
+    r"these |the key |the planned |the new )\b",
+    re.I,
+)
+
+
+def merge_continuations(items: list[str]) -> list[str]:
+    """Merge continuation sentences with their preceding item."""
+    if not items:
+        return items
+    merged: list[str] = [items[0]]
+    for item in items[1:]:
+        if CONTINUATION_PATTERNS.search(item) and merged:
+            merged[-1] = merged[-1].rstrip(".") + ". " + item
+        else:
+            merged.append(item)
+    return merged
+
+
 def build_business_update_bullets(paragraphs: list[str], company_name: str, max_bullets: int = 9) -> list[str]:
     """Extract the most informative paragraphs as bullet points, scored by content richness."""
     cleaned = clean_update_paragraphs(paragraphs)
+    # Merge continuation sentences before splitting
+    cleaned = merge_continuations(cleaned)
     # Split multi-sentence paragraphs into separate candidates
     expanded: list[str] = []
     for text in cleaned:
@@ -630,6 +654,8 @@ def build_business_update_bullets(paragraphs: list[str], company_name: str, max_
         if text.endswith((":", "：")):
             continue
         expanded.extend(split_into_sentences(text))
+    # Merge again after splitting (in case split created new continuations)
+    expanded = merge_continuations(expanded)
     scored: list[tuple[float, str]] = []
     for text in expanded:
         score = score_paragraph_informativeness(text)
@@ -1965,6 +1991,23 @@ def write_docx(
         heading_paragraph = doc.paragraphs[occ.heading_index]
         for run in heading_paragraph.runs:
             run.font.bold = True
+
+    # Final pass: remove ALL remaining blank paragraphs in the document
+    # (except those before section headings, which serve as visual separators)
+    heading_indices = {occ.heading_index for occ in safe_occurrences()}
+    to_remove = []
+    for idx, paragraph in enumerate(doc.paragraphs):
+        if not is_plain_blank_paragraph(paragraph):
+            continue
+        # Keep blank before a section heading (visual separator)
+        if idx + 1 < len(doc.paragraphs) and (idx + 1) in heading_indices:
+            continue
+        to_remove.append(paragraph)
+    for paragraph in reversed(to_remove):
+        element = paragraph._element
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
 
     doc.save(str(output_path))
 
