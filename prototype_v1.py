@@ -582,16 +582,36 @@ def score_paragraph_informativeness(text: str) -> float:
     return score
 
 
+def split_into_sentences(text: str) -> list[str]:
+    """Split a long paragraph into individual sentences for separate bullets."""
+    # Don't split short text
+    if len(text) < 120:
+        return [text]
+    # Split on sentence boundaries, but not on abbreviations like "U.S." or "e.g."
+    # or on decimal numbers like "2.67m"
+    parts = re.split(r'(?<=[.!])\s+(?=[A-Z\d])', text)
+    result = []
+    for part in parts:
+        part = norm_space(part)
+        if len(part) >= 20:
+            result.append(part)
+    return result if result else [text]
+
+
 def build_business_update_bullets(paragraphs: list[str], company_name: str, max_bullets: int = 9) -> list[str]:
     """Extract the most informative paragraphs as bullet points, scored by content richness."""
     cleaned = clean_update_paragraphs(paragraphs)
-    scored: list[tuple[float, str]] = []
+    # Split multi-sentence paragraphs into separate candidates
+    expanded: list[str] = []
     for text in cleaned:
         text = norm_space(text)
         if len(text) < 20:
             continue
         if text.endswith((":", "：")):
             continue
+        expanded.extend(split_into_sentences(text))
+    scored: list[tuple[float, str]] = []
+    for text in expanded:
         score = score_paragraph_informativeness(text)
         scored.append((score, text))
 
@@ -1766,25 +1786,30 @@ def write_docx(
             run.font.size = Pt(size_pt)
         run.font.bold = bold
 
+    # --- Fill Business Activities (re-resolve before each major step) ---
     occurrences = resolve_section_plan_to_doc(doc, section_plan)
-
     for occ_idx, occurrence in enumerate(occurrences):
         body = get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx)
         if occurrence.canonical == "Business Activities":
             fill_section_paragraphs(doc, body, [business_activities_map.get(occurrence.language, business_activities_map.get("english", ""))])
 
+    # --- Fill Business Update middle sections (re-resolve after Business Activities may have shifted indices) ---
+    occurrences = resolve_section_plan_to_doc(doc, section_plan)
     update_occurrences_by_language = middle_section_indices_by_language(occurrences)
-    risk_occurrences_by_language: dict[str, list[int]] = {"english": [], "chinese": []}
-    for occ_idx, occurrence in enumerate(occurrences):
-        if occurrence.canonical == "Risk & Exit":
-            risk_occurrences_by_language[occurrence.language].append(occ_idx)
 
     for language, occ_indices in update_occurrences_by_language.items():
         if not occ_indices:
             continue
-        heading_texts = [doc.paragraphs[occurrences[occ_idx].heading_index].text for occ_idx in occ_indices]
+        # Re-resolve fresh for each language group to get current indices
+        occurrences = resolve_section_plan_to_doc(doc, section_plan)
+        update_occ = middle_section_indices_by_language(occurrences).get(language, [])
+        if not update_occ:
+            continue
+        heading_texts = [doc.paragraphs[occurrences[occ_idx].heading_index].text for occ_idx in update_occ]
         chunks = allocate_middle_section_bullets(heading_texts, business_update_map.get(language, []))
-        for occ_idx, texts in zip(occ_indices, chunks):
+        for occ_idx, texts in zip(update_occ, chunks):
+            # Re-resolve before each fill to handle shifting from prior fills
+            occurrences = resolve_section_plan_to_doc(doc, section_plan)
             body = get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx)
             fill_section_paragraphs(doc, body, texts, force_bullets=True)
 
