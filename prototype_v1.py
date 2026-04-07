@@ -909,24 +909,29 @@ def find_current_quarter_total_header(finance_source: dict[str, Any], target_qua
         if parse_quarter_label(header) == target_quarter:
             return header
     exact_subtotal = []
-    summary_candidates = []
     for header in finance_source["header"]:
         lowered = header.lower()
         if any(token in lowered for token in ["ytd", "accum", "exp", "qoq", "yoy", "预计", "预估"]):
             continue
         if parse_quarter_label(header) == target_quarter:
             exact_subtotal.append(header)
-        if "总计" in header or "小计" in header or "subtotal" in lowered:
-            summary_candidates.append(header)
         # Match quarter number without year (e.g., "Q4", "第四季度")
         q_num = extract_quarter_number(header)
         if q_num == target_quarter.quarter and parse_quarter_label(header) is None:
             if not any(skip in lowered for skip in ["exp", "预计"]):
                 exact_subtotal.append(header)
+        # Match "总计/subtotal" ONLY if it also contains the target quarter identifier
+        if "总计" in header or "小计" in header or "subtotal" in lowered:
+            parsed_q = parse_quarter_label(header)
+            if parsed_q == target_quarter:
+                exact_subtotal.append(header)
+            elif parsed_q is None:
+                # Generic total without quarter — only use if no quarter-specific header found
+                q_in_header = extract_quarter_number(header)
+                if q_in_header == target_quarter.quarter:
+                    exact_subtotal.append(header)
     if exact_subtotal:
         return exact_subtotal[0]
-    if summary_candidates:
-        return summary_candidates[0]
     return None
 
 
@@ -1021,29 +1026,35 @@ def normalize_previous_quarter_headers(raw_headers: list[str], previous_review_q
 def detect_unit_spec(text: str) -> UnitSpec | None:
     normalized = norm_space(text).lower()
     compact = normalized.replace(" ", "")
+    # IMPORTANT: More specific (longer) patterns MUST come before shorter ones
+    # e.g. "百万元人民币" before "万元人民币" since the latter is a substring of the former
     candidates: list[tuple[str, Decimal]] = [
         ("usdk", Decimal("1000")),
         ("kusd", Decimal("1000")),
         ("k usd", Decimal("1000")),
+        ("amount in usd million", Decimal("1000000")),
+        ("in millions usd", Decimal("1000000")),
+        ("in usd million", Decimal("1000000")),
         ("usd million", Decimal("1000000")),
         ("millions usd", Decimal("1000000")),
         ("million usd", Decimal("1000000")),
-        ("in usd million", Decimal("1000000")),
-        ("in millions usd", Decimal("1000000")),
-        ("amount in usd million", Decimal("1000000")),
-        ("unit: usd", Decimal("1")),
         ("financial data (unit: usd)", Decimal("1")),
-        ("单位：万元人民币", Decimal("10000")),
-        ("万元人民币", Decimal("10000")),
-        ("万元 人民币", Decimal("10000")),
+        ("unit: usd", Decimal("1")),
+        # Chinese: 百万 (million) patterns BEFORE 万 (ten-thousand) patterns
         ("单位：百万元人民币", Decimal("1000000")),
         ("百万元人民币", Decimal("1000000")),
         ("单位：百万人民币", Decimal("1000000")),
         ("百万人民币", Decimal("1000000")),
+        ("百万元", Decimal("1000000")),
+        ("百万", Decimal("1000000")),
+        ("单位：万元人民币", Decimal("10000")),
+        ("万元人民币", Decimal("10000")),
+        ("万元 人民币", Decimal("10000")),
+        ("万元", Decimal("10000")),
+        ("unit: rmb in millions", Decimal("1000000")),
         ("rmb in millions", Decimal("1000000")),
         ("amount in rmb mn", Decimal("1000000")),
         ("rmb mn", Decimal("1000000")),
-        ("unit: rmb in millions", Decimal("1000000")),
     ]
     for needle, factor in candidates:
         if needle in normalized or needle.replace(" ", "") in compact:
@@ -1126,6 +1137,22 @@ def determine_target_quarter_with_debug(current_path: Path, current_title: str, 
     return quarter, f"fallback latest_quarter_from_current using finance headers {current_finance['header']}"
 
 
+# Cross-language metric aliases: map English labels to their Chinese equivalents and vice versa
+METRIC_ALIASES: dict[str, list[str]] = {
+    "revenue": ["收入", "收入金额", "营业收入", "主营业务收入", "销售收入"],
+    "gross profit": ["毛利", "毛利润", "毛利额"],
+    "net profit": ["净利", "净利润", "净利额", "纯利"],
+    "net income": ["净利", "净利润", "净收入"],
+    "ebitda": ["ebitda", "息税折旧摊销前利润"],
+    "cash inflow": ["现金流入", "经营性现金流入"],
+    "cash outflow": ["现金支出", "经营性现金支出"],
+    "burn rate": ["烧钱率", "月均净现金消耗"],
+    "收入": ["revenue", "net revenue", "收入金额"],
+    "毛利": ["gross profit", "毛利润"],
+    "净利": ["net profit", "net income", "净利润"],
+}
+
+
 def choose_finance_row_label(
     previous_label: str,
     finance_rows: dict[str, dict[str, str]],
@@ -1172,9 +1199,41 @@ def choose_finance_row_label(
         )
         return exact_matches[0]
 
+    # Try cross-language alias matching before fuzzy
+    norm_prev = normalize_metric_label(previous_label)
+    aliases = METRIC_ALIASES.get(norm_prev, [])
+    alias_matches = []
+    for candidate, values in finance_rows.items():
+        if parse_decimal(values.get(current_total_header, "")) is None:
+            continue
+        if candidate in used_source_labels and used_source_labels[candidate] != previous_label:
+            continue
+        norm_cand = normalize_metric_label(candidate)
+        for alias in aliases:
+            if norm_cand == normalize_metric_label(alias) or normalize_metric_label(alias) in norm_cand:
+                alias_matches.append(candidate)
+                print(f"    LABEL_MATCH: ALIAS match '{candidate}' via alias '{alias}'")
+                break
+    if len(alias_matches) == 1:
+        print(f"    LABEL_MATCH: RESULT → alias match: '{alias_matches[0]}'")
+        return alias_matches[0]
+    if len(alias_matches) > 1:
+        print(f"    LABEL_MATCH: multiple alias matches: {alias_matches}, using first")
+        return alias_matches[0]
+
     best_label: str | None = None
-    best_score: tuple[Decimal, int] | None = None
+    best_score: tuple[int, Decimal] | None = None
     ambiguous = False
+
+    # Also check for Chinese substring containment: if one label contains the other
+    # (e.g. "收入" in "收入金额"), give bonus token score
+    def containment_bonus(prev_label: str, candidate_label: str) -> int:
+        prev_cn = "".join(re.findall(r"[\u4e00-\u9fff]", prev_label))
+        cand_cn = "".join(re.findall(r"[\u4e00-\u9fff]", candidate_label))
+        if prev_cn and cand_cn:
+            if prev_cn in cand_cn or cand_cn in prev_cn:
+                return 5
+        return 0
 
     print(f"    LABEL_MATCH: no exact match found, trying fuzzy. prev_tokens={prev_tokens}")
     for candidate, values in finance_rows.items():
@@ -1184,7 +1243,7 @@ def choose_finance_row_label(
         if candidate_value is None:
             continue
         cand_tokens = metric_tokens(candidate)
-        token_score = len(prev_tokens & cand_tokens)
+        token_score = len(prev_tokens & cand_tokens) + containment_bonus(previous_label, candidate)
 
         previous_value = parse_decimal(previous_current_value or "")
         continuity_penalty = Decimal("999999")
@@ -1196,7 +1255,8 @@ def choose_finance_row_label(
                 candidate_converted = candidate_value / Decimal("1000")
             continuity_penalty = abs(candidate_converted - previous_value)
 
-        score = (-continuity_penalty, token_score)
+        # Token overlap is PRIMARY (higher = better); continuity penalty is tiebreaker (lower = better)
+        score = (token_score, -continuity_penalty)
         print(f"    LABEL_MATCH_FUZZY: '{candidate}' tokens={cand_tokens} overlap={token_score} penalty={continuity_penalty} score={score}")
         if best_score is None or score > best_score:
             best_label = candidate
