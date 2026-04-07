@@ -1492,15 +1492,6 @@ def set_cell_text_preserve(cell, text: str) -> None:
     set_paragraph_text_preserve(cell.paragraphs[0], text)
 
 
-
-    if paragraph.runs:
-        paragraph.runs[0].text = text
-        for run in paragraph.runs[1:]:
-            run.text = ""
-    else:
-        paragraph.add_run(text)
-
-
 def capture_run_format(paragraph) -> tuple[str | None, float | None, bool | None]:
     for run in paragraph.runs:
         font_name = run.font.name
