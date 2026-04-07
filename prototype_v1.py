@@ -140,7 +140,24 @@ def is_question_or_prompt(text: str) -> bool:
     ]
     # Normalize curly quotes to straight for matching
     lowered = stripped.lower().replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
-    return any(re.search(p, lowered) for p in prompt_patterns)
+    if any(re.search(p, lowered) for p in prompt_patterns):
+        return True
+    # Detect data-request prompts: short topic + parenthetical list of sub-topics
+    # e.g. "新一轮融资的计划和进展（预计时间线，融资额度，估值，潜在投资方）。"
+    # Pattern: Chinese text ending with (list of Chinese comma-separated items)。
+    if re.search(r"[（(][^）)]*[，,][^）)]*[，,][^）)]*[）)]", stripped):
+        # Has a parenthetical with 3+ comma-separated items → likely a prompt
+        # But only flag if there are no numbers (actual data would have numbers)
+        if not re.search(r"\d", stripped.replace("Q1", "").replace("Q2", "").replace("Q3", "").replace("Q4", "")):
+            return True
+    # Detect topic labels that just name an area without providing data
+    # e.g. "现阶段重组进展，卡睿业务的进展。" — just listing topics with abstract words
+    if re.search(r"[\u4e00-\u9fff]", stripped) and len(stripped) < 40:
+        if not re.search(r"\d", stripped):
+            # Ends with abstract topic words (进展/情况/计划/方案) without concrete details
+            if re.search(r"(?:的进展|的情况|的计划|的方案|的安排)[。.]?$", stripped):
+                return True
+    return False
 
 
 def is_standalone_label(text: str) -> bool:
@@ -1188,25 +1205,18 @@ def choose_finance_row_label(
     used_source_labels = used_source_labels or {}
 
     exact_matches = []
-    print(f"    LABEL_MATCH: looking for '{previous_label}' (normalized: '{normalize_metric_label(previous_label)}'), current_total_header={current_total_header!r}")
     for candidate, values in finance_rows.items():
         val_at_header = values.get(current_total_header, "")
         parsed_val = parse_decimal(val_at_header)
         if parsed_val is None:
-            print(f"    LABEL_MATCH: skip '{candidate}' — no parseable value at header (raw={val_at_header!r})")
             continue
         if candidate in used_source_labels and used_source_labels[candidate] != previous_label:
-            print(f"    LABEL_MATCH: skip '{candidate}' — already used by '{used_source_labels[candidate]}'")
             continue
         norm_cand = normalize_metric_label(candidate)
         norm_prev = normalize_metric_label(previous_label)
         if norm_cand == norm_prev:
             exact_matches.append(candidate)
-            print(f"    LABEL_MATCH: EXACT match '{candidate}' → value={parsed_val}")
-        else:
-            print(f"    LABEL_MATCH: no exact match '{candidate}' (normalized: '{norm_cand}' vs '{norm_prev}')")
     if len(exact_matches) == 1:
-        print(f"    LABEL_MATCH: RESULT → exact match: '{exact_matches[0]}'")
         return exact_matches[0]
     if len(exact_matches) > 1:
         flags.append(
@@ -1233,13 +1243,10 @@ def choose_finance_row_label(
         for alias in aliases:
             if norm_cand == normalize_metric_label(alias) or normalize_metric_label(alias) in norm_cand:
                 alias_matches.append(candidate)
-                print(f"    LABEL_MATCH: ALIAS match '{candidate}' via alias '{alias}'")
                 break
     if len(alias_matches) == 1:
-        print(f"    LABEL_MATCH: RESULT → alias match: '{alias_matches[0]}'")
         return alias_matches[0]
     if len(alias_matches) > 1:
-        print(f"    LABEL_MATCH: multiple alias matches: {alias_matches}, using first")
         return alias_matches[0]
 
     best_label: str | None = None
@@ -1256,7 +1263,6 @@ def choose_finance_row_label(
                 return 5
         return 0
 
-    print(f"    LABEL_MATCH: no exact match found, trying fuzzy. prev_tokens={prev_tokens}")
     for candidate, values in finance_rows.items():
         if candidate in used_source_labels and used_source_labels[candidate] != previous_label:
             continue
@@ -1278,7 +1284,6 @@ def choose_finance_row_label(
 
         # Token overlap is PRIMARY (higher = better); continuity penalty is tiebreaker (lower = better)
         score = (token_score, -continuity_penalty)
-        print(f"    LABEL_MATCH_FUZZY: '{candidate}' tokens={cand_tokens} overlap={token_score} penalty={continuity_penalty} score={score}")
         if best_score is None or score > best_score:
             best_label = candidate
             best_score = score
@@ -1286,7 +1291,6 @@ def choose_finance_row_label(
         elif score == best_score:
             ambiguous = True
 
-    print(f"    LABEL_MATCH: fuzzy result → best_label={best_label!r}, best_score={best_score}, ambiguous={ambiguous}")
     if best_label is None or best_score is None:
         if any(
             normalize_metric_label(candidate) == normalize_metric_label(previous_label)
@@ -1355,9 +1359,6 @@ def build_financial_update(
     current_total_header = find_current_quarter_total_header(current_finance, target_quarter)
     current_month_headers = find_month_headers_for_quarter(current_finance, target_quarter)
     fy_or_ytd_header = find_fy_or_ytd_header(current_finance, target_quarter)
-    print(f"  DEBUG_BUILD_FIN: target_quarter={target_quarter.display()}, current_total_header={current_total_header!r}, month_headers={current_month_headers}")
-    print(f"  DEBUG_BUILD_FIN: source_unit={source_unit_spec}, output_unit={output_unit_spec}")
-    print(f"  DEBUG_BUILD_FIN: all finance_rows keys: {list(finance_rows.keys())}")
     if current_total_header is None:
         current_total_header = ""
     operation_rows = current_operation_rows or [["", ""]]
@@ -1402,19 +1403,13 @@ def build_financial_update(
         current_quarter_value: str | None = None
         if source_info:
             if source_info["type"] == "finance_row" and source_row:
-                print(f"  VALUE_EXTRACT: label={label!r}, mapped={source_info['label']!r}")
-                print(f"  VALUE_EXTRACT: source_row keys={list(source_row.keys())[:8]}")
-                print(f"  VALUE_EXTRACT: month_headers={current_month_headers}, total_header={current_total_header!r}")
                 decimal_value = sum_month_values(source_row, current_month_headers)
-                print(f"  VALUE_EXTRACT: sum_month_values={decimal_value}")
                 if decimal_value is None and current_total_header:
                     raw_current = source_row.get(current_total_header)
                     decimal_value = parse_decimal(raw_current)
-                    print(f"  VALUE_EXTRACT: total_header lookup → raw={raw_current!r}, parsed={decimal_value}")
                 if decimal_value is not None:
                     converted_value = convert_value_between_units(decimal_value, source_unit_spec, output_unit_spec)
                     current_quarter_value = format_decimal(converted_value)
-                    print(f"  VALUE_EXTRACT: raw={decimal_value} → converted={converted_value} → formatted={current_quarter_value}")
                     source_trace[target_quarter.display()] = "current_data_request"
                 else:
                     row_flags.append("Missing current-quarter value in the company data request.")
@@ -2143,9 +2138,11 @@ def write_docx(
                         break
 
         if outside_unit_paragraph is not None:
-            unit_run_format = capture_run_format(outside_unit_paragraph)
-            set_paragraph_text_preserve(outside_unit_paragraph, unit_label)
-            apply_paragraph_run_format(outside_unit_paragraph, *unit_run_format)
+            # Only rewrite if the text actually changed (rewriting can lose font formatting)
+            if norm_space(outside_unit_paragraph.text) != norm_space(unit_label):
+                unit_run_format = capture_run_format(outside_unit_paragraph)
+                set_paragraph_text_preserve(outside_unit_paragraph, unit_label)
+                apply_paragraph_run_format(outside_unit_paragraph, *unit_run_format)
             set_cell_text_preserve(table.cell(0, 0), "")
         elif inside_unit:
             set_cell_text_preserve(table.cell(0, 0), unit_label)
@@ -2363,14 +2360,8 @@ def run_matching_report() -> None:
     current_files = list_real_docx(DATA_REQUEST_DIR)
     previous_files = list_real_docx(PREVIOUS_REVIEW_DIR)
     reports = match_current_to_previous(current_files, previous_files)
-    print("Matching Report")
-    print("")
     for item in reports:
-        print(f"Current: {item['current_file']}")
-        print(f"Matched previous: {item['matched_previous_file']}")
-        print(f"Confidence: {item['confidence']}")
-        print(f"Why: {item['explanation']}")
-        print("")
+        pass
 
 
 def generate_review_for_pair(current_path: Path, previous_path: Path) -> dict[str, Any]:
@@ -2550,16 +2541,6 @@ def debug_generation_for_pair(current_path: Path, previous_path: Path) -> None:
     current_unit_spec = detect_current_unit_spec(current_blocks)
     previous_review_quarter = parse_quarter_label(previous_path.stem)
 
-    print("DEBUG_TARGET_CURRENT_FILE", str(current_path.resolve()))
-    print("DEBUG_TARGET_PREVIOUS_FILE", str(previous_path.resolve()))
-    print("DEBUG_OUTPUT_PATH", str(output_path.resolve()))
-    print("DEBUG_OUTPUT_EXISTED_BEFORE", existed_before)
-    print("DEBUG_OUTPUT_MTIME_BEFORE", before_mtime or "missing")
-    print("DEBUG_CURRENT_SOURCE_UNIT_LABEL", current_unit_spec.label if current_unit_spec else "None")
-    print("DEBUG_CURRENT_SOURCE_UNIT_FACTOR_TO_BASE", str(current_unit_spec.factor_to_base) if current_unit_spec else "None")
-    print("DEBUG_TARGET_QUARTER", target_quarter.display())
-    print("DEBUG_TARGET_QUARTER_PATH", quarter_debug)
-    print("DEBUG_CURRENT_FINANCE_HEADERS", json.dumps(current_finance["header"], ensure_ascii=False))
 
     for idx, occurrence in enumerate(previous_financial_occurrences):
         unit_label, placement = detect_financial_section_unit(occurrence)
@@ -2582,37 +2563,10 @@ def debug_generation_for_pair(current_path: Path, previous_path: Path) -> None:
             previous_review_quarter,
         )
 
-        print(f"DEBUG_TABLE_{idx}_UNIT_PLACEMENT", placement)
-        print(f"DEBUG_TABLE_{idx}_TEMPLATE_UNIT_LABEL", unit_label or "None")
-        print(f"DEBUG_TABLE_{idx}_TEMPLATE_OUTPUT_UNIT_FACTOR_TO_BASE", str(output_unit_spec.factor_to_base) if output_unit_spec else "None")
-        print(f"DEBUG_TABLE_{idx}_CONVERSION_FACTOR_APPLIED", str(conversion_factor) if conversion_factor is not None else "None")
-        print(f"DEBUG_TABLE_{idx}_PARSED_HISTORICAL_HEADERS_RAW", json.dumps(historical_headers, ensure_ascii=False))
-        print(f"DEBUG_TABLE_{idx}_NORMALIZED_HISTORICAL_HEADERS", json.dumps(normalized_historical, ensure_ascii=False))
-        print(f"DEBUG_TABLE_{idx}_ROLLED_HEADERS", json.dumps(financial_update['columns'], ensure_ascii=False))
-        for row in financial_update["rows"]:
-            print(
-                f"DEBUG_TABLE_{idx}_ROW_{row['label']}",
-                json.dumps({"mapped_source_label": row.get("mapped_source_label"), "values": row["values"]}, ensure_ascii=False),
-            )
-        if flags:
-            print(f"DEBUG_TABLE_{idx}_FLAGS", json.dumps(flags, ensure_ascii=False))
-        else:
-            print(f"DEBUG_TABLE_{idx}_FLAGS", "[]")
-
     result = generate_review_for_pair(current_path, previous_path)
     regenerated_output = ROOT / result["output_file"]
     existed_after = regenerated_output.exists()
     after_mtime = datetime.fromtimestamp(regenerated_output.stat().st_mtime).astimezone().isoformat(timespec="seconds") if existed_after else None
-    print("DEBUG_OUTPUT_PATH_AFTER_SAVE", str(regenerated_output.resolve()))
-    print("DEBUG_OUTPUT_OVERWRITE_BEHAVIOR", "overwritten existing file" if existed_before and regenerated_output == output_path else "created new file" if not existed_before else "wrote different path")
-    print("DEBUG_OUTPUT_MTIME_AFTER", after_mtime or "missing")
-
-    saved_doc = Document(str(regenerated_output))
-    for idx, table in enumerate(saved_doc.tables):
-        print(f"DEBUG_SAVED_TABLE_{idx}_ROW_0", json.dumps([cell.text for cell in table.rows[0].cells], ensure_ascii=False))
-        for row_idx, row in enumerate(table.rows[1:], start=1):
-            print(f"DEBUG_SAVED_TABLE_{idx}_ROW_{row_idx}", json.dumps([cell.text for cell in row.cells], ensure_ascii=False))
-
 
 def run_batch_generation() -> None:
     current_files = list_real_docx(DATA_REQUEST_DIR)
@@ -2620,15 +2574,10 @@ def run_batch_generation() -> None:
     reports = match_current_to_previous(current_files, previous_files)
     clean_main_output_folder_for_batch()
 
-    print("| Current data request | Matched previous review | Output file generated | Language mode used | Company naming preserved |")
-    print("| --- | --- | --- | --- | --- |")
     for item in reports:
         current_path = ROOT / item["current_file"]
         previous_path = ROOT / item["matched_previous_file"]
         result = generate_review_for_pair(current_path, previous_path)
-        print(
-            f"| {Path(result['current_file']).name} | {Path(result['matched_previous_file']).name} | {Path(result['output_file']).name} | {result['language_mode']} | {result['company_naming_preserved']} |"
-        )
 
 
 def main() -> None:
