@@ -290,11 +290,14 @@ def is_middle_section_heading_candidate(paragraph) -> bool:
     text = norm_space(paragraph.text)
     if not text:
         return False
-    if text.endswith((".", "。", ";", "；", ":", "：", "?", "？")):
+    if text.endswith((".", "。", ";", "；", ":", "：", "?", "？", ")", "）")):
         return False
     if len(text) > 80:
         return False
-    if text.startswith(("-", "•", "*")):
+    if text.startswith(("-", "•", "*", "(", "（")):
+        return False
+    # Unit text should never be a section heading
+    if is_unit_text(text):
         return False
     style_name = paragraph.style.name.lower() if paragraph.style and paragraph.style.name else ""
     if "list" in style_name or "heading" in style_name or "标题" in style_name or style_name == "normal":
@@ -2153,9 +2156,23 @@ def write_docx(
                     break
                 set_cell_text_preserve(table.cell(row_idx, col_idx), row_data["values"].get(header) or "")
 
+        # Build per-row fallback format from the first cell in each row that has formatting
+        row_defaults: dict[int, tuple] = {}
+        for r_idx in range(len(table.rows)):
+            for c_idx in range(len(table.rows[r_idx].cells)):
+                fmt = formatting.get((r_idx, c_idx), (None, None, None, None))
+                if any(v is not None for v in fmt):
+                    row_defaults[r_idx] = fmt
+                    break
+
         for r_idx, row in enumerate(table.rows):
+            fallback = row_defaults.get(r_idx, (None, None, None, None))
             for c_idx, cell in enumerate(row.cells):
-                font_name, east_asia_font, size_pt, bold = formatting.get((r_idx, c_idx), (None, None, None, None))
+                fmt = formatting.get((r_idx, c_idx), (None, None, None, None))
+                # If this cell had no formatting, use the row default
+                if not any(v is not None for v in fmt):
+                    fmt = fallback
+                font_name, east_asia_font, size_pt, bold = fmt
                 for paragraph in cell.paragraphs:
                     for run in paragraph.runs:
                         apply_table_run_format(run, font_name, east_asia_font, size_pt, bold)
