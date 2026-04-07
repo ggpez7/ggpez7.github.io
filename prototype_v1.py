@@ -909,6 +909,7 @@ def find_current_quarter_total_header(finance_source: dict[str, Any], target_qua
         if parse_quarter_label(header) == target_quarter:
             return header
     exact_subtotal = []
+    yearly_total = []
     for header in finance_source["header"]:
         lowered = header.lower()
         if any(token in lowered for token in ["ytd", "accum", "exp", "qoq", "yoy", "预计", "预估"]):
@@ -920,18 +921,38 @@ def find_current_quarter_total_header(finance_source: dict[str, Any], target_qua
         if q_num == target_quarter.quarter and parse_quarter_label(header) is None:
             if not any(skip in lowered for skip in ["exp", "预计"]):
                 exact_subtotal.append(header)
-        # Match "总计/subtotal" ONLY if it also contains the target quarter identifier
+        # Match "总计/subtotal" with target quarter identifier
         if "总计" in header or "小计" in header or "subtotal" in lowered:
             parsed_q = parse_quarter_label(header)
             if parsed_q == target_quarter:
                 exact_subtotal.append(header)
             elif parsed_q is None:
-                # Generic total without quarter — only use if no quarter-specific header found
                 q_in_header = extract_quarter_number(header)
                 if q_in_header == target_quarter.quarter:
                     exact_subtotal.append(header)
+                elif q_in_header is None:
+                    # Generic yearly total (e.g. "2025总计") — use as last resort
+                    if str(target_quarter.year) in header:
+                        yearly_total.append(header)
     if exact_subtotal:
         return exact_subtotal[0]
+    # Fall back to yearly total if no quarter-specific header found
+    # (the actual Q4 value will come from month summation, but this header
+    # is needed for choose_finance_row_label to filter rows that have data)
+    if yearly_total:
+        return yearly_total[0]
+    # Last resort: any non-metadata column with numeric data
+    skip_patterns = {"qoq", "yoy", "exp", "预计", "预估"}
+    for header in finance_source["header"]:
+        lowered = header.lower()
+        if any(s in lowered for s in skip_patterns):
+            continue
+        if parse_month_header(header) is not None:
+            continue
+        # Check if at least one row has a parseable value
+        for row_data in finance_source["rows"].values():
+            if parse_decimal(row_data.get(header, "")) is not None:
+                return header
     return None
 
 
@@ -1472,13 +1493,13 @@ def build_financial_update(
             if yoy_value is None:
                 row_flags.append("YoY could not be determined from the rolled quarter values.")
 
-            if source_info["label"] == "company_outlets":
+            if source_info and source_info["label"] == "company_outlets":
                 values[final_total_header] = company_outlets_total
                 if company_outlets_total is not None:
                     source_trace[final_total_header] = "current_data_request"
                 else:
                     row_flags.append(f"{final_total_header} is missing for company-owned outlets.")
-            elif source_info["label"] == "jv_outlets":
+            elif source_info and source_info["label"] == "jv_outlets":
                 values[final_total_header] = jv_outlets_total
                 if jv_outlets_total is not None:
                     source_trace[final_total_header] = "current_data_request"
