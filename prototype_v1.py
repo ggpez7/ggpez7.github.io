@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 import zipfile
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -20,6 +21,7 @@ from docx.enum.text import WD_BREAK
 from docx.oxml import OxmlElement
 from docx.shared import Pt
 from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
 
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
@@ -45,7 +47,6 @@ SECTION_ALIASES = {
         "business activities",
         "business information",
         "business introduction",
-        "company overview",
         "公司介绍",
     ],
     "Financial Update": [
@@ -67,8 +68,6 @@ SECTION_ALIASES = {
     "Risk & Exit": [
         "risk & exit",
         "risk and exit",
-        "risks & exit",
-        "risks and exit",
     ],
 }
 
@@ -82,6 +81,28 @@ QUESTION_PREFIXES_TO_IGNORE = [
     "What is the strategic plan for 2026?",
     "What is the company’s plan for the next round of financing",
     "What is the company's plan for the next round of financing",
+    "Please provide",
+    "Please briefly",
+    "Please elaborate",
+    "Provide",
+    "Include",
+    "What is",
+    "What are",
+    "How is",
+    "How are",
+    "How many",
+    "Are there",
+    "Is there",
+    "When will",
+    "Why",
+    "If there is",
+    "see notes to investors",
+    "请",
+    "提供",
+    "介绍",
+    "说明",
+    "解释",
+    "是否",
 ]
 
 STANDALONE_LABELS_TO_IGNORE = {
@@ -95,6 +116,39 @@ STANDALONE_LABELS_TO_IGNORE = {
 
 def norm_space(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
+
+
+def strip_company_speaker_prefix(text: str) -> str:
+    cleaned = norm_space(text)
+    cleaned = re.sub(r"^[A-Za-z][A-Za-z0-9&().,\- ]{0,40}:\s*", "", cleaned)
+    cleaned = re.sub(r"^[\u4e00-\u9fffA-Za-z0-9&().,\- ]{1,40}：\s*", "", cleaned)
+    return norm_space(cleaned)
+
+
+def is_prompt_like_text(text: str) -> bool:
+    cleaned = norm_space(text)
+    lowered = cleaned.lower()
+    if not cleaned:
+        return True
+    if any(cleaned.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
+        return True
+    if cleaned in STANDALONE_LABELS_TO_IGNORE:
+        return True
+    if re.search(r"[?？]$", cleaned):
+        return True
+    if re.match(r"^\d+[.)-]\s*", cleaned):
+        body = re.sub(r"^\d+[.)-]\s*", "", cleaned)
+        if re.search(r"[?？]$", body):
+            return True
+        if any(body.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
+            return True
+    if re.match(r"^(please|provide|include|what|how|when|why|are there|is there)\b", lowered):
+        return True
+    if re.match(r"^(请|提供|介绍|说明|解释|是否|如有)", cleaned):
+        return True
+    if "预计时间线" in cleaned and "融资额度" in cleaned and "估值" in cleaned:
+        return True
+    return False
 
 
 def is_unit_text(text: str) -> bool:
@@ -189,34 +243,6 @@ def canonical_heading(text: str) -> str | None:
     return None
 
 
-def fixed_anchor_heading(text: str) -> str | None:
-    lowered = norm_space(text).lower()
-    lowered = re.sub(r"^[0-9一二三四五六七八九十]+[\-–、.\s]*", "", lowered)
-    for canonical in ["Business Activities", "Financial Update", "Risk & Exit"]:
-        for alias in SECTION_ALIASES.get(canonical, []):
-            if lowered == alias or lowered.startswith(alias):
-                return canonical
-    if "风险" in lowered and "退出" in lowered:
-        return "Risk & Exit"
-    return None
-
-
-def is_middle_section_heading_candidate(paragraph) -> bool:
-    text = norm_space(paragraph.text)
-    if not text:
-        return False
-    if text.endswith((".", "。", ";", "；", ":", "：", "?", "？")):
-        return False
-    if len(text) > 80:
-        return False
-    if text.startswith(("-", "•", "*")):
-        return False
-    style_name = paragraph.style.name.lower() if paragraph.style and paragraph.style.name else ""
-    if "list" in style_name or "heading" in style_name or "标题" in style_name or style_name == "normal":
-        return True
-    return False
-
-
 def extract_previous_sections(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     sections: dict[str, Any] = {}
     current_heading: str | None = None
@@ -309,6 +335,7 @@ class SectionOccurrence:
 class DocSectionOccurrence:
     canonical: str
     language: str
+    heading_text: str
     heading_index: int
 
 
@@ -430,10 +457,8 @@ def parse_current_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             for item in trailing:
                 if item["type"] != "paragraph":
                     continue
-                text = item["text"]
-                if any(text.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
-                    continue
-                if text in STANDALONE_LABELS_TO_IGNORE:
+                text = strip_company_speaker_prefix(item["text"])
+                if is_prompt_like_text(text):
                     continue
                 result["business_update_paragraphs"].append(text)
             break
@@ -446,10 +471,8 @@ def parse_current_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             if not seen_table or block["type"] != "paragraph":
                 continue
-            text = block["text"]
-            if any(text.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
-                continue
-            if text in STANDALONE_LABELS_TO_IGNORE:
+            text = strip_company_speaker_prefix(block["text"])
+            if is_prompt_like_text(text):
                 continue
             if len(text) < 2:
                 continue
@@ -532,6 +555,7 @@ def short_sentence(text: str, company_name: str, limit: int = 140) -> str:
 
 
 def build_business_update_bullets(paragraphs: list[str], company_name: str) -> list[str]:
+    paragraphs = clean_update_paragraphs(paragraphs)
     full_text = " ".join(norm_space(p) for p in paragraphs)
     lower = full_text.lower()
     bullets: list[str] = []
@@ -587,12 +611,10 @@ def build_business_update_bullets(paragraphs: list[str], company_name: str) -> l
 def clean_update_paragraphs(paragraphs: list[str]) -> list[str]:
     cleaned: list[str] = []
     for text in paragraphs:
-        text = norm_space(text)
+        text = strip_company_speaker_prefix(text)
         if not text:
             continue
-        if any(text.startswith(prefix) for prefix in QUESTION_PREFIXES_TO_IGNORE):
-            continue
-        if text in STANDALONE_LABELS_TO_IGNORE:
+        if is_prompt_like_text(text):
             continue
         if text in {
             "Other Questions:",
@@ -603,9 +625,7 @@ def clean_update_paragraphs(paragraphs: list[str]) -> list[str]:
             "如有较大的收入/毛利下滑或上升，请解释背后原因：",
         }:
             continue
-        if re.search(r"[?？]$", text):
-            continue
-        if re.match(r"^\d+[.)]", text):
+        if text.lower().startswith("see notes to investors"):
             continue
         cleaned.append(text)
     return cleaned
@@ -620,47 +640,6 @@ def bullet_topic(text: str) -> str:
     if any(token in lowered for token in ["计划", "扩张", "outlet", "growth", "expansion", "rollout", "trend", "progress", "channel", "product", "certification"]):
         return "growth"
     return "general"
-
-
-def section_heading_preference(heading_text: str) -> list[str]:
-    lowered = norm_space(heading_text).lower()
-    if any(token in lowered for token in ["运营", "operation", "review", "业务回顾", "recent"]):
-        return ["operations", "general", "growth", "finance"]
-    if any(token in lowered for token in ["进展", "progress", "highlight", "trend", "业务进展", "business"]):
-        return ["growth", "finance", "general", "operations"]
-    return ["general", "operations", "growth", "finance"]
-
-
-def allocate_middle_section_bullets(headings: list[str], bullets: list[str]) -> list[list[str]]:
-    if not headings:
-        return []
-    if len(headings) == 1:
-        return [bullets]
-
-    remaining = [(bullet, bullet_topic(bullet)) for bullet in bullets]
-    allocations: list[list[str]] = []
-    for idx, heading in enumerate(headings):
-        if idx == len(headings) - 1:
-            allocations.append([bullet for bullet, _topic in remaining])
-            break
-        preferred = section_heading_preference(heading)
-        chosen: list[str] = []
-        still_remaining = []
-        used_topics = set()
-        for bullet, topic in remaining:
-            if topic in preferred[:2] and topic not in used_topics:
-                chosen.append(bullet)
-                used_topics.add(topic)
-            else:
-                still_remaining.append((bullet, topic))
-        if not chosen and remaining:
-            chosen.append(remaining[0][0])
-            still_remaining = remaining[1:]
-        allocations.append(chosen)
-        remaining = still_remaining
-    while len(allocations) < len(headings):
-        allocations.append([])
-    return allocations
 
 
 def build_chinese_business_update_bullets(paragraphs: list[str]) -> list[str]:
@@ -1271,6 +1250,74 @@ def build_financial_update(
     }
 
 
+def financial_table_strength(prev_financial: dict[str, Any], previous_review_quarter: Quarter | None) -> tuple[int, int, tuple[int, int]]:
+    normalized_headers = normalize_previous_quarter_headers(prev_financial["headers"], previous_review_quarter)
+    parsed_quarters = [parse_quarter_label(normalized) for _, normalized in normalized_headers]
+    unique_quarters = sorted({quarter.display(): quarter for quarter in parsed_quarters if quarter is not None}.values())
+    has_previous_quarter = 0
+    if previous_review_quarter is not None:
+        has_previous_quarter = 1 if any(quarter == previous_review_quarter for quarter in unique_quarters) else 0
+    latest_quarter = max(((quarter.year, quarter.quarter) for quarter in unique_quarters), default=(-1, -1))
+    return (has_previous_quarter, len(unique_quarters), latest_quarter)
+
+
+def choose_financial_truth_index(previous_tables: list[dict[str, Any]], previous_review_quarter: Quarter | None) -> int:
+    if not previous_tables:
+        return 0
+    best_index = 0
+    best_score = financial_table_strength(previous_tables[0], previous_review_quarter)
+    for idx, prev_financial in enumerate(previous_tables[1:], start=1):
+        score = financial_table_strength(prev_financial, previous_review_quarter)
+        if score > best_score:
+            best_index = idx
+            best_score = score
+    return best_index
+
+
+def adapt_financial_update_to_template(
+    master_update: dict[str, Any],
+    target_prev_financial: dict[str, Any],
+) -> dict[str, Any]:
+    master_unit_spec = detect_unit_spec(master_update.get("unit", ""))
+    target_unit_spec = detect_unit_spec(target_prev_financial.get("unit", ""))
+    master_rows_by_label = {normalize_metric_label(row["label"]): row for row in master_update["rows"]}
+    adapted_rows: list[dict[str, Any]] = []
+
+    for idx, target_prev_row in enumerate(target_prev_financial["rows"]):
+        target_label = target_prev_row["label"]
+        master_row = master_rows_by_label.get(normalize_metric_label(target_label))
+        if master_row is None and idx < len(master_update["rows"]):
+            master_row = master_update["rows"][idx]
+        if master_row is None:
+            continue
+
+        adapted_values: dict[str, str | None] = {}
+        for header, value in master_row["values"].items():
+            if header in {"QoQ", "YoY"} or value in {None, ""}:
+                adapted_values[header] = value
+                continue
+            decimal_value = parse_decimal(value)
+            converted = convert_value_between_units(decimal_value, master_unit_spec, target_unit_spec)
+            adapted_values[header] = format_decimal(converted) if decimal_value is not None else value
+
+        adapted_rows.append(
+            {
+                "label": target_label,
+                "mapped_source_label": master_row.get("mapped_source_label"),
+                "values": adapted_values,
+                "source_trace": dict(master_row.get("source_trace", {})),
+                "flags": list(master_row.get("flags", [])),
+            }
+        )
+
+    return {
+        "status": master_update.get("status", "updated_with_flags"),
+        "unit": target_prev_financial.get("unit") or master_update.get("unit"),
+        "columns": list(master_update["columns"]),
+        "rows": adapted_rows,
+    }
+
+
 def build_markdown(
     business_activities: str,
     financial_update: dict[str, Any],
@@ -1323,91 +1370,23 @@ def split_evenly(items: list[str], count: int) -> list[list[str]]:
 
 def detect_doc_section_occurrences(doc: Document) -> list[DocSectionOccurrence]:
     occurrences: list[DocSectionOccurrence] = []
-    after_financial: dict[str, bool] = {"english": False, "chinese": False}
-    after_risk: dict[str, bool] = {"english": False, "chinese": False}
     for idx, paragraph in enumerate(doc.paragraphs):
-        text = paragraph.text
-        language = text_language(text)
-        canonical = fixed_anchor_heading(text)
+        canonical = canonical_heading(paragraph.text)
         if canonical:
             occurrences.append(
                 DocSectionOccurrence(
                     canonical=canonical,
-                    language=language,
+                    language=text_language(paragraph.text),
+                    heading_text=norm_space(paragraph.text),
                     heading_index=idx,
                 )
             )
-            if canonical == "Financial Update":
-                after_financial[language] = True
-                after_risk[language] = False
-            elif canonical == "Risk & Exit":
-                after_risk[language] = True
-            continue
-
-        canonical = canonical_heading(text)
-        if canonical == "Business Update":
-            occurrences.append(
-                DocSectionOccurrence(
-                    canonical=canonical,
-                    language=language,
-                    heading_index=idx,
-                )
-            )
-            continue
-
-        if after_financial[language] and not after_risk[language] and is_middle_section_heading_candidate(paragraph):
-            occurrences.append(
-                DocSectionOccurrence(
-                    canonical="Business Update",
-                    language=language,
-                    heading_index=idx,
-                )
-            )
-    return occurrences
-
-
-def resolve_section_plan_to_doc(doc: Document, section_plan: list[SectionOccurrence]) -> list[DocSectionOccurrence]:
-    occurrences: list[DocSectionOccurrence] = []
-    paragraph_index = 0
-    for planned in section_plan:
-        target = norm_space(planned.heading_text)
-        for idx in range(paragraph_index, len(doc.paragraphs)):
-            if norm_space(doc.paragraphs[idx].text) == target:
-                occurrences.append(
-                    DocSectionOccurrence(
-                        canonical=planned.canonical,
-                        language=planned.language,
-                        heading_index=idx,
-                    )
-                )
-                paragraph_index = idx + 1
-                break
     return occurrences
 
 
 def template_language_mode(occurrences: list[DocSectionOccurrence]) -> str:
     languages = {occ.language for occ in occurrences}
     return "bilingual" if "english" in languages and "chinese" in languages else "English-only"
-
-
-def middle_section_indices_by_language(occurrences: list[DocSectionOccurrence]) -> dict[str, list[int]]:
-    result: dict[str, list[int]] = {"english": [], "chinese": []}
-    for language in ["english", "chinese"]:
-        language_occurrences = [(idx, occ) for idx, occ in enumerate(occurrences) if occ.language == language]
-        financial_idx = next((idx for idx, occ in language_occurrences if occ.canonical == "Financial Update"), None)
-        risk_idx = next((idx for idx, occ in language_occurrences if occ.canonical == "Risk & Exit" and financial_idx is not None and idx > financial_idx), None)
-        if financial_idx is None:
-            continue
-        upper = risk_idx if risk_idx is not None else len(occurrences)
-        for idx, occ in enumerate(occurrences):
-            if occ.language != language:
-                continue
-            if idx <= financial_idx or idx >= upper:
-                continue
-            if occ.canonical in {"Business Activities", "Financial Update", "Risk & Exit"}:
-                continue
-            result[language].append(idx)
-    return result
 
 
 def get_body_paragraphs_for_occurrence(doc: Document, occurrences: list[DocSectionOccurrence], occurrence_index: int):
@@ -1477,6 +1456,15 @@ def copy_paragraph_layout(target, source) -> None:
     dst_fmt.keep_with_next = src_fmt.keep_with_next
     dst_fmt.page_break_before = src_fmt.page_break_before
     dst_fmt.widow_control = src_fmt.widow_control
+
+
+def insert_paragraph_after(paragraph, text: str):
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    new_paragraph = Paragraph(new_p, paragraph._parent)
+    if text:
+        new_paragraph.add_run(text)
+    return new_paragraph
 
 
 def paragraph_is_list_like(paragraph) -> bool:
@@ -1560,6 +1548,34 @@ def fill_section_paragraphs(doc: Document, paragraphs, texts: list[str], force_b
             parent.remove(element)
 
 
+def replace_section_body_with_paragraphs(doc: Document, occurrences: list[DocSectionOccurrence], occurrence_index: int, texts: list[str], force_bullets: bool = False) -> None:
+    heading_paragraph = doc.paragraphs[occurrences[occurrence_index].heading_index]
+    body = list(get_body_paragraphs_for_occurrence(doc, occurrences, occurrence_index))
+
+    reference = None
+    if force_bullets:
+        reference = next((p for p in body if paragraph_is_list_like(p) and p.text.strip()), None)
+    if reference is None:
+        reference = next((p for p in body if p.text.strip()), None)
+    if reference is None:
+        reference = heading_paragraph
+
+    template_run_format = capture_run_format(reference)
+
+    for paragraph in reversed(body):
+        element = paragraph._element
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+
+    current_anchor = heading_paragraph
+    for text in texts:
+        new_paragraph = insert_paragraph_after(current_anchor, text)
+        copy_paragraph_layout(new_paragraph, reference)
+        apply_paragraph_run_format(new_paragraph, *template_run_format)
+        current_anchor = new_paragraph
+
+
 def paragraph_has_drawing(paragraph) -> bool:
     return bool(paragraph._element.xpath(".//*[local-name()='drawing' or local-name()='pict']"))
 
@@ -1640,18 +1656,47 @@ def insert_page_break_and_repeated_logo(doc: Document, template_path: Path, occu
 
 
 def remove_blank_paragraphs_inside_sections(doc: Document, occurrences: list[DocSectionOccurrence] | None = None) -> None:
-    occurrences = occurrences or detect_doc_section_occurrences(doc)
-    to_remove = []
-    for occ_idx, _occurrence in enumerate(occurrences):
-        body = list(get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx))
-        for paragraph in body:
-            if is_plain_blank_paragraph(paragraph):
-                to_remove.append(paragraph)
-    for paragraph in reversed(to_remove):
-        element = paragraph._element
-        parent = element.getparent()
-        if parent is not None:
-            parent.remove(element)
+    while True:
+        occurrences = occurrences or detect_doc_section_occurrences(doc)
+        to_remove = []
+        for occ_idx, _occurrence in enumerate(occurrences):
+            body = list(get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx))
+            for paragraph in body:
+                if is_plain_blank_paragraph(paragraph):
+                    to_remove.append(paragraph)
+        if not to_remove:
+            break
+        for paragraph in reversed(to_remove):
+            element = paragraph._element
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
+        occurrences = None
+
+
+def remove_duplicate_paragraphs_inside_sections(doc: Document, occurrences: list[DocSectionOccurrence] | None = None) -> None:
+    while True:
+        occurrences = occurrences or detect_doc_section_occurrences(doc)
+        to_remove = []
+        for occ_idx, _occurrence in enumerate(occurrences):
+            body = list(get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx))
+            previous_text = None
+            for paragraph in body:
+                current_text = norm_space(paragraph.text)
+                if not current_text:
+                    continue
+                if previous_text == current_text:
+                    to_remove.append(paragraph)
+                else:
+                    previous_text = current_text
+        if not to_remove:
+            break
+        for paragraph in reversed(to_remove):
+            element = paragraph._element
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
+        occurrences = None
 
 
 def normalize_bullet_sections(doc: Document, occurrences: list[DocSectionOccurrence] | None = None) -> None:
@@ -1674,6 +1719,15 @@ def normalize_exact_single_blank_between_sections(doc: Document, occurrences: li
     occurrences = occurrences or detect_doc_section_occurrences(doc)
     if not occurrences:
         return
+
+    leading_blank_templates = []
+    has_leading_logo = any(paragraph_has_drawing(paragraph) for paragraph in doc.paragraphs[: occurrences[0].heading_index])
+    if has_leading_logo:
+        idx = occurrences[0].heading_index - 1
+        while idx >= 0 and is_plain_blank_paragraph(doc.paragraphs[idx]):
+            leading_blank_templates.append(doc.paragraphs[idx]._element)
+            idx -= 1
+        leading_blank_templates.reverse()
 
     first_english_heading_index = None
     if any(occ.language == "english" for occ in occurrences) and any(occ.language == "chinese" for occ in occurrences):
@@ -1712,6 +1766,28 @@ def normalize_exact_single_blank_between_sections(doc: Document, occurrences: li
             except Exception:
                 pass
 
+    if has_leading_logo:
+        occurrences = detect_doc_section_occurrences(doc)
+        if occurrences:
+            first_heading_paragraph = doc.paragraphs[occurrences[0].heading_index]
+            previous = first_heading_paragraph._element.getprevious()
+            while previous is not None:
+                prev_paragraph = next((p for p in doc.paragraphs if p._element is previous), None)
+                if prev_paragraph is None or not is_plain_blank_paragraph(prev_paragraph):
+                    break
+                remove_paragraph(prev_paragraph)
+                previous = first_heading_paragraph._element.getprevious()
+
+            if leading_blank_templates:
+                for blank_element in reversed(leading_blank_templates):
+                    first_heading_paragraph._p.addprevious(deepcopy(blank_element))
+            else:
+                blank = first_heading_paragraph.insert_paragraph_before("")
+                try:
+                    blank.style = doc.styles["Normal"]
+                except Exception:
+                    pass
+
 
 def center_table(table) -> None:
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -1726,11 +1802,10 @@ def center_table(table) -> None:
 def write_docx(
     output_path: Path,
     template_path: Path,
-    section_plan: list[SectionOccurrence],
     business_activities_map: dict[str, str],
     financial_updates: list[dict[str, Any]],
     business_update_map: dict[str, list[str]],
-    risk_exit_map: dict[str, list[str]],
+    risk_exit_map: dict[tuple[str, str], list[str]],
 ) -> None:
     doc = Document(str(template_path))
 
@@ -1747,35 +1822,30 @@ def write_docx(
             run.font.size = Pt(size_pt)
         run.font.bold = bold
 
-    occurrences = resolve_section_plan_to_doc(doc, section_plan)
+    occurrences = detect_doc_section_occurrences(doc)
 
     for occ_idx, occurrence in enumerate(occurrences):
         body = get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx)
         if occurrence.canonical == "Business Activities":
             fill_section_paragraphs(doc, body, [business_activities_map.get(occurrence.language, business_activities_map.get("english", ""))])
 
-    update_occurrences_by_language = middle_section_indices_by_language(occurrences)
-    risk_occurrences_by_language: dict[str, list[int]] = {"english": [], "chinese": []}
+    business_occurrences_by_language: dict[str, list[int]] = {"english": [], "chinese": []}
     for occ_idx, occurrence in enumerate(occurrences):
-        if occurrence.canonical == "Risk & Exit":
-            risk_occurrences_by_language[occurrence.language].append(occ_idx)
+        if occurrence.canonical == "Business Update":
+            business_occurrences_by_language[occurrence.language].append(occ_idx)
 
-    for language, occ_indices in update_occurrences_by_language.items():
+    for language, occ_indices in business_occurrences_by_language.items():
         if not occ_indices:
             continue
-        heading_texts = [doc.paragraphs[occurrences[occ_idx].heading_index].text for occ_idx in occ_indices]
-        chunks = allocate_middle_section_bullets(heading_texts, business_update_map.get(language, []))
-        for occ_idx, texts in zip(occ_indices, chunks):
-            body = get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx)
-            fill_section_paragraphs(doc, body, texts, force_bullets=True)
+        chunks = split_evenly(business_update_map.get(language, []), len(occ_indices))
+        for occ_idx, texts in reversed(list(zip(occ_indices, chunks))):
+            replace_section_body_with_paragraphs(doc, occurrences, occ_idx, texts, force_bullets=True)
 
-    for language, occ_indices in risk_occurrences_by_language.items():
-        if not occ_indices:
+    for occ_idx, occurrence in reversed(list(enumerate(occurrences))):
+        if occurrence.canonical != "Risk & Exit":
             continue
-        chunks = split_evenly(risk_exit_map.get(language, []), len(occ_indices))
-        for occ_idx, texts in zip(occ_indices, chunks):
-            body = get_body_paragraphs_for_occurrence(doc, occurrences, occ_idx)
-            fill_section_paragraphs(doc, body, texts, force_bullets=True)
+        texts = risk_exit_map.get((occurrence.language, occurrence.heading_text), [])
+        replace_section_body_with_paragraphs(doc, occurrences, occ_idx, texts, force_bullets=True)
 
     financial_occurrences = [occ for occ in occurrences if occ.canonical == "Financial Update"]
     for table_idx, table in enumerate(doc.tables):
@@ -1841,11 +1911,11 @@ def write_docx(
                     for run in paragraph.runs:
                         apply_table_run_format(run, font_name, size_pt, bold)
 
-    insert_page_break_and_repeated_logo(doc, template_path, occurrences)
-    occurrences = resolve_section_plan_to_doc(doc, section_plan)
-    remove_blank_paragraphs_inside_sections(doc, occurrences)
-    normalize_bullet_sections(doc, occurrences)
-    normalize_exact_single_blank_between_sections(doc, occurrences)
+    insert_page_break_and_repeated_logo(doc, template_path)
+    remove_blank_paragraphs_inside_sections(doc)
+    remove_duplicate_paragraphs_inside_sections(doc)
+    normalize_bullet_sections(doc)
+    normalize_exact_single_blank_between_sections(doc)
 
     doc.save(str(output_path))
 
@@ -2043,28 +2113,37 @@ def generate_review_for_pair(current_path: Path, previous_path: Path) -> dict[st
     json_output = DEBUG_OUTPUT_DIR / f"{final_company_name}_{final_quarter_label}.json"
     markdown_output = DEBUG_OUTPUT_DIR / f"{final_company_name}_{final_quarter_label}.md"
 
-    financial_updates = [
-        build_financial_update(
-            prev_financial,
+    financial_updates: list[dict[str, Any]] = []
+    if previous_tables:
+        truth_index = choose_financial_truth_index(previous_tables, previous_review_quarter)
+        truth_prev_financial = previous_tables[truth_index]
+        truth_update = build_financial_update(
+            truth_prev_financial,
             current_finance,
             current_parsed.get("operation_table"),
             review_flags,
             target_quarter,
             current_unit_spec,
-            detect_unit_spec(prev_financial.get("unit", "")),
+            detect_unit_spec(truth_prev_financial.get("unit", "")),
             previous_review_quarter,
         )
-        for prev_financial in previous_tables
-    ]
+        for idx, prev_financial in enumerate(previous_tables):
+            if idx == truth_index:
+                financial_updates.append(truth_update)
+            else:
+                financial_updates.append(adapt_financial_update_to_template(truth_update, prev_financial))
 
     business_activity_map: dict[str, str] = {}
-    risk_exit_map: dict[str, list[str]] = {}
+    risk_exit_map: dict[tuple[str, str], list[str]] = {}
+    previous_risk_exit_by_language: dict[str, list[str]] = {}
     previous_business_update_map: dict[str, list[str]] = {}
     for occurrence in previous_occurrences:
         if occurrence.canonical == "Business Activities" and occurrence.paragraphs:
             business_activity_map.setdefault(occurrence.language, " ".join(occurrence.paragraphs).strip())
         elif occurrence.canonical == "Risk & Exit" and occurrence.paragraphs:
-            risk_exit_map.setdefault(occurrence.language, occurrence.paragraphs)
+            risk_exit_map[(occurrence.language, occurrence.heading_text)] = occurrence.paragraphs
+            previous_risk_exit_by_language.setdefault(occurrence.language, [])
+            previous_risk_exit_by_language[occurrence.language].extend(occurrence.paragraphs)
         elif occurrence.canonical == "Business Update" and occurrence.paragraphs:
             previous_business_update_map.setdefault(occurrence.language, [])
             previous_business_update_map[occurrence.language].extend(occurrence.paragraphs)
@@ -2110,7 +2189,7 @@ def generate_review_for_pair(current_path: Path, previous_path: Path) -> dict[st
     language_mode = template_language_mode(template_occurrences)
     primary_financial_update = financial_updates[-1] if financial_updates else {}
     primary_business_activities = business_activity_map.get("english") or next(iter(business_activity_map.values()), "")
-    primary_risk = risk_exit_map.get("english") or next(iter(risk_exit_map.values()), [])
+    primary_risk = previous_risk_exit_by_language.get("english") or next(iter(previous_risk_exit_by_language.values()), [])
     primary_business_update = business_update_map.get("english") or next(iter(business_update_map.values()), [])
 
     output_payload = {
@@ -2157,7 +2236,7 @@ def generate_review_for_pair(current_path: Path, previous_path: Path) -> dict[st
         build_markdown(primary_business_activities, primary_financial_update, primary_business_update, primary_risk),
         encoding="utf-8",
     )
-    write_docx(final_docx_path, previous_path, previous_occurrences, business_activity_map, financial_updates, business_update_map, risk_exit_map)
+    write_docx(final_docx_path, previous_path, business_activity_map, financial_updates, business_update_map, risk_exit_map)
 
     return {
         "current_file": str(current_path.relative_to(ROOT)),
