@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import json
 import re
 import sys
@@ -100,6 +101,14 @@ def is_question_or_prompt(text: str) -> bool:
         r"\bplease provide\b.*\bexplanation\b",
         r"^see notes to\b",
         r">\s*see notes to\b",
+        r"^what'?s the\b",
+        r"^when (?:is|will|did)\b",
+        r"^where (?:is|are)\b",
+        r"^why (?:is|are|did)\b",
+        r"^is there\b",
+        r"^are there\b",
+        r"^do you\b",
+        r"^have you\b",
         r"^请",
         r"^【重要】请",
         r"如有较大的.*请解释",
@@ -632,6 +641,15 @@ def build_business_update_bullets(paragraphs: list[str], company_name: str, max_
     return bullets
 
 
+def strip_response_prefix(text: str) -> str:
+    """Strip Q&A response prefixes like 'CompanyName: ...' or 'Yes, CompanyName ...'."""
+    # Strip "CompanyName: " or "CompanyName, " at start
+    text = re.sub(r"^[A-Z][A-Za-z\s]{1,30}:\s*", "", text)
+    # Strip "Yes, " or "Yes. " at start
+    text = re.sub(r"^(?:Yes|No)[,.\s]+\s*", "", text, flags=re.I)
+    return norm_space(text)
+
+
 def clean_update_paragraphs(paragraphs: list[str]) -> list[str]:
     cleaned: list[str] = []
     for text in paragraphs:
@@ -641,6 +659,9 @@ def clean_update_paragraphs(paragraphs: list[str]) -> list[str]:
         if is_question_or_prompt(text):
             continue
         if is_standalone_label(text):
+            continue
+        text = strip_response_prefix(text)
+        if not text or len(text) < 10:
             continue
         cleaned.append(text)
     return cleaned
@@ -1512,6 +1533,16 @@ def copy_paragraph_layout(target, source) -> None:
     dst_fmt.keep_with_next = src_fmt.keep_with_next
     dst_fmt.page_break_before = src_fmt.page_break_before
     dst_fmt.widow_control = src_fmt.widow_control
+    # Copy bullet/numbering properties (numPr) from source to target
+    src_pPr = source._element.find(qn("w:pPr"))
+    if src_pPr is not None:
+        src_numPr = src_pPr.find(qn("w:numPr"))
+        if src_numPr is not None:
+            tgt_pPr = target._element.get_or_add_pPr()
+            old_numPr = tgt_pPr.find(qn("w:numPr"))
+            if old_numPr is not None:
+                tgt_pPr.remove(old_numPr)
+            tgt_pPr.append(copy.deepcopy(src_numPr))
 
 
 def paragraph_is_list_like(paragraph) -> bool:
@@ -1876,6 +1907,10 @@ def write_docx(
 
         for r_idx, row in enumerate(table.rows):
             for c_idx, cell in enumerate(row.cells):
+                # Remove extra blank paragraphs inside cells (keeps only the first)
+                while len(cell.paragraphs) > 1:
+                    last = cell.paragraphs[-1]
+                    last._element.getparent().remove(last._element)
                 font_name, size_pt, bold = formatting.get((r_idx, c_idx), (None, None, None))
                 for paragraph in cell.paragraphs:
                     for run in paragraph.runs:
