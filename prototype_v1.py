@@ -396,6 +396,12 @@ def parse_quarter_label(text: str) -> Quarter | None:
     match = re.search(r"(20\d{2})Q([1-4])", text)
     if match:
         return Quarter(int(match.group(1)), int(match.group(2)))
+    # Chinese quarter formats: "2025年第4季度", "2025年Q4", "2025第四季度"
+    cn_digits = {"一": 1, "二": 2, "三": 3, "四": 4}
+    match = re.search(r"(20\d{2})\s*年?\s*第?\s*([1-4一二三四])\s*季度", text)
+    if match:
+        q = cn_digits.get(match.group(2), None) or int(match.group(2))
+        return Quarter(int(match.group(1)), q)
     return None
 
 
@@ -412,6 +418,10 @@ def extract_quarter_number(text: str) -> int | None:
 def parse_month_header(text: str) -> tuple[int, int] | None:
     normalized = norm_space(text)
     match = re.search(r"(20\d{2})[/-]?(0[1-9]|1[0-2])", normalized)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    # Chinese month formats: "2025年1月", "2025年01月", "1月" (without year)
+    match = re.search(r"(20\d{2})\s*年\s*(1[0-2]|0?[1-9])\s*月", normalized)
     if match:
         return int(match.group(1)), int(match.group(2))
     return None
@@ -876,8 +886,21 @@ def metric_tokens(text: str) -> set[str]:
         "accumulated",
     }
     normalized = normalize_metric_label(text)
-    if re.search(r"[\u4e00-\u9fff]", normalized) and " " not in normalized:
-        return {normalized}
+    # For Chinese text, tokenize at the character level so partial matches work
+    # e.g. "收入" tokens = {"收", "入", "收入"} which overlaps with "营业收入"
+    chinese_chars = re.findall(r"[\u4e00-\u9fff]", normalized)
+    if chinese_chars:
+        tokens = set(chinese_chars)
+        # Also add the full Chinese string and any contiguous Chinese substrings of length 2+
+        chinese_only = "".join(chinese_chars)
+        tokens.add(chinese_only)
+        for length in range(2, len(chinese_chars)):
+            for start in range(len(chinese_chars) - length + 1):
+                tokens.add(chinese_only[start:start + length])
+        # Also include any English tokens
+        english_parts = re.sub(r"[\u4e00-\u9fff]+", " ", normalized)
+        tokens |= {t for t in english_parts.split() if t not in stopwords}
+        return tokens
     return {token for token in normalized.split() if token not in stopwords}
 
 
@@ -889,12 +912,17 @@ def find_current_quarter_total_header(finance_source: dict[str, Any], target_qua
     summary_candidates = []
     for header in finance_source["header"]:
         lowered = header.lower()
-        if any(token in lowered for token in ["ytd", "accum", "exp", "qoq", "yoy"]):
+        if any(token in lowered for token in ["ytd", "accum", "exp", "qoq", "yoy", "预计", "预估"]):
             continue
         if parse_quarter_label(header) == target_quarter:
             exact_subtotal.append(header)
-        if "总计" in header or "subtotal" in lowered:
+        if "总计" in header or "小计" in header or "subtotal" in lowered:
             summary_candidates.append(header)
+        # Match quarter number without year (e.g., "Q4", "第四季度")
+        q_num = extract_quarter_number(header)
+        if q_num == target_quarter.quarter and parse_quarter_label(header) is None:
+            if not any(skip in lowered for skip in ["exp", "预计"]):
+                exact_subtotal.append(header)
     if exact_subtotal:
         return exact_subtotal[0]
     if summary_candidates:
@@ -1105,6 +1133,8 @@ def choose_finance_row_label(
     previous_current_value: str | None,
     flags: list[dict[str, Any]],
     used_source_labels: dict[str, str] | None = None,
+    source_unit_spec: "UnitSpec | None" = None,
+    output_unit_spec: "UnitSpec | None" = None,
 ) -> str | None:
     prev_tokens = metric_tokens(previous_label)
     used_source_labels = used_source_labels or {}
@@ -1147,8 +1177,12 @@ def choose_finance_row_label(
         previous_value = parse_decimal(previous_current_value or "")
         continuity_penalty = Decimal("999999")
         if previous_value is not None:
-            candidate_millions = candidate_value / Decimal("1000")
-            continuity_penalty = abs(candidate_millions - previous_value)
+            # Convert candidate value to output units using actual unit specs
+            if source_unit_spec is not None and output_unit_spec is not None:
+                candidate_converted = convert_value_between_units(candidate_value, source_unit_spec, output_unit_spec) or candidate_value
+            else:
+                candidate_converted = candidate_value / Decimal("1000")
+            continuity_penalty = abs(candidate_converted - previous_value)
 
         score = (-continuity_penalty, token_score)
         if best_score is None or score > best_score:
@@ -1254,6 +1288,8 @@ def build_financial_update(
                 previous_current_value,
                 flags,
                 used_source_labels,
+                source_unit_spec,
+                output_unit_spec,
             )
             source_info = {"type": "finance_row", "label": mapped_label} if mapped_label else None
             if mapped_label:
