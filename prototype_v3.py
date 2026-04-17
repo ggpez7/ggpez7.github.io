@@ -16,7 +16,7 @@ import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -1138,13 +1138,20 @@ def extract_previous_section_occurrences(blocks: list[dict[str, Any]]) -> list[S
 
 
 def parse_previous_financial_table(rows: list[list[str]]) -> dict[str, Any]:
+    if not rows or not rows[0]:
+        return {"unit": "", "headers": [], "rows": []}
     header_row = rows[0]
     unit = header_row[0]
     headers = [norm_space(cell) for cell in header_row[1:]]
     data_rows = []
     for row in rows[1:]:
+        if not row:
+            continue
         label = norm_space(row[0])
-        values = {headers[i]: norm_space(row[i + 1]) for i in range(len(headers))}
+        values = {
+            headers[i]: norm_space(row[i + 1]) if i + 1 < len(row) else ""
+            for i in range(len(headers))
+        }
         data_rows.append({"label": label, "values": values})
     return {"unit": unit, "headers": headers, "rows": data_rows}
 
@@ -1292,7 +1299,7 @@ def parse_decimal(text: str) -> Decimal | None:
         return None
     try:
         value = Decimal(cleaned) * suffix_multiplier
-    except Exception:
+    except (InvalidOperation, ValueError):
         return None
     return -value if negative else value
 
@@ -1639,6 +1646,8 @@ def parse_current_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def rows_to_dict(rows: list[list[str]]) -> dict[str, dict[str, str]]:
+    if not rows or not rows[0]:
+        return {}
     headers = rows[0][1:]
     mapping: dict[str, dict[str, str]] = {}
     for row in rows[1:]:
@@ -1682,6 +1691,8 @@ def extract_outlet_counts(operation_rows: list[list[str]]) -> tuple[str | None, 
 
 
 def normalize_finance_source(rows: list[list[str]]) -> dict[str, Any]:
+    if not rows or not rows[0]:
+        return {"header": [], "rows": {}}
     header = [norm_space(cell) for cell in rows[0]]
     row_map = rows_to_dict(rows)
     return {
